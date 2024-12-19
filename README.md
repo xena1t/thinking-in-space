@@ -5,7 +5,7 @@
 <img src="docs/resources/preview.png" width="50%"/>
 <br />
 
-<a href="" target="_blank">
+<a href="https://arxiv.org/abs/2412.14171" target="_blank">
     <img alt="arXiv" src="https://img.shields.io/badge/arXiv-thinking--in--space-red?logo=arxiv" height="20" />
 </a>
 <a href="https://vision-x-nyu.github.io/thinking-in-space.github.io/" target="_blank">

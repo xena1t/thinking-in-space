@@ -86,7 +86,7 @@ conda create --name vsibench python=3.10
 conda activate vsibench
 
 git clone git@github.com:vision-x-nyu/thinking-in-space.git
-cd thinking_in_space
+cd thinking-in-space
 
 git submodule update --init --recursive
 

@@ -6,6 +6,7 @@ from loguru import logger as eval_logger
 from functools import partial
 import numpy as np
 import pandas as pd
+from collections import OrderedDict
 
 import datasets
 
@@ -123,12 +124,12 @@ def vsibench_process_results(doc, results):
 
 def vsibench_aggregate_results(results):
     results = pd.DataFrame(results)
-    
+
     output = {}
 
     for question_type, question_type_indexes in results.groupby('question_type').groups.items():
         per_question_type = results.iloc[question_type_indexes]
-        
+
         if question_type in MCA_QUESTION_TYPES:
             for metric in METRICS_FOR_MCA.keys():
                 output[f"{question_type}_{metric}"] = per_question_type[metric].mean()
@@ -141,13 +142,44 @@ def vsibench_aggregate_results(results):
 
         else:
             raise ValueError(f"Unknown question type: {question_type}")
-    
-    output['object_rel_direction_accuracy'] = sum([
-        output.pop('object_rel_direction_easy_accuracy'),
-        output.pop('object_rel_direction_medium_accuracy'),
-        output.pop('object_rel_direction_hard_accuracy'),
-    ]) / 3.
-    
+
+    if 'object_rel_direction_easy_accuracy' in output:
+        output['object_rel_direction_accuracy'] = sum([
+            output.pop('object_rel_direction_easy_accuracy'),
+            output.pop('object_rel_direction_medium_accuracy'),
+            output.pop('object_rel_direction_hard_accuracy'),
+        ]) / 3.
+
     output['overall'] = sum([_ for _ in output.values()]) / len(output)
     eval_logger.info(f"Evaluation results: {output}")
-    return output['overall'] * 100.
+
+    results = OrderedDict()
+    results["overall"] = output["overall"].item() * 100.
+    
+    for question_type in [
+        "object_counting",
+        "object_abs_distance",
+        "object_size_estimation",
+        "room_size_estimation",
+        "object_rel_distance",
+        "object_rel_direction",
+        "route_planning",
+        "obj_appearance_order",
+    ]:
+        for metric in [
+            "accuracy",
+            "MRA:.5:.95:.05",
+        ]:
+            key = f"{question_type}_{metric}"
+            if key in output:
+                results[key] = output[key].item() * 100.
+
+    tabulated_keys = ", ".join([_ for _ in results.keys()])
+    tabulated_results = ", ".join([f"{_:.3f}" for _ in results.values()])
+    eval_logger.info(f"Tabulated results: {tabulated_keys}")
+    eval_logger.info(f"Tabulated results: {tabulated_results}")
+
+    results["tabulated_keys"] = tabulated_keys
+    results["tabulated_results"] = tabulated_results
+
+    return results

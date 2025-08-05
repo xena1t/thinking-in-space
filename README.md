@@ -36,7 +36,8 @@
 </div>
 
 ## Release
-- `2025-02-27` :hearts: Our paper `Thinking-in-Space` is accepted by CVPR 2025! See u in Nashville!
+- `2025-08-05` :hearts: We release the meta information used in our VSIBench! Check out at `/data/meta_info`!
+- `2025-02-27` :hearts: Our paper `Thinking-in-Space` is accepted by CVPR 2025 as Oral! See u in Nashville!
 - `2024-12-19` :rocket: We released our VSI-Bench and corresponding evaluation code.
 
 ## Contents

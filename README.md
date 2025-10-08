@@ -109,6 +109,30 @@ bash evaluate_all_in_one.sh --model all --num_processes 8 --benchmark vsibench
 
 > Note: The evaluation results for open-source models may differ slightly from our tables due to additional data refinement. We will update the tables and our paper soon.
 
+#### Evaluate Qwen3-VL on VSI-Bench
+
+To mirror the Thinking in Space pipeline with the latest Qwen release, place the
+[Qwen3-VL](https://github.com/QwenLM/Qwen3-VL) repository alongside this
+project (or set `QWEN3_VL_REPO` to its path) so that the shared
+`qwen-vl-utils` package is discoverable. The benchmark automatically streams the
+question-answer pairs from the
+[nyu-visionx/VSI-Bench](https://huggingface.co/datasets/nyu-visionx/VSI-Bench)
+dataset via 🤗 Datasets, so no extra preprocessing is required.
+
+Once the dependencies are ready you can launch the evaluation with
+
+```bash
+accelerate launch --num_processes 1 -m lmms_eval \
+  --model qwen3vl \
+  --model_args pretrained=Qwen/Qwen3-VL-7B-Instruct,modality=video,max_frames_num=32 \
+  --tasks vsibench \
+  --batch_size 1 \
+  --output_path logs/qwen3vl/vsibench
+```
+
+The helper script `evaluate_all_in_one.sh --model qwen3vl_7b_32f` wraps the same
+command and logs predictions for inspection.
+
 ## Limitations
 
 We strive to maintain the highest quality in our benchmark, but some imperfections may persist. If you notice any, we encourage you to reach out and share your valuable feedback!

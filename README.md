@@ -124,13 +124,13 @@ Once the dependencies are ready you can launch the evaluation with
 ```bash
 accelerate launch --num_processes 1 -m lmms_eval \
   --model qwen3vl \
-  --model_args pretrained=Qwen/Qwen3-VL-7B-Instruct,modality=video,max_frames_num=32 \
+  --model_args pretrained=Qwen/Qwen3-VL-30B-A3B-Instruct,modality=video,max_frames_num=32 \
   --tasks vsibench \
   --batch_size 1 \
   --output_path logs/qwen3vl/vsibench
 ```
 
-The helper script `evaluate_all_in_one.sh --model qwen3vl_7b_32f` wraps the same
+The helper script `evaluate_all_in_one.sh --model qwen3vl_30b_32f` wraps the same
 command and logs predictions for inspection.
 
 ## Limitations

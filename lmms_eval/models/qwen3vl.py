@@ -25,7 +25,7 @@ class Qwen3VL(lmms):
 
     def __init__(
         self,
-        pretrained: str = "Qwen/Qwen3-VL-7B-Instruct",
+        pretrained: str = "Qwen/Qwen3-VL-30B-A3B-Instruct",
         modality: str = "video",
         device: str = "cuda",
         device_map: str = "cuda",

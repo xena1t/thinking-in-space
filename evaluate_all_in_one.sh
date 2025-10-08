@@ -155,7 +155,7 @@ for model in "${models[@]}"; do
 
     evaluate_script="$evaluate_script -m lmms_eval \
         --model $model_family \
-        --model_args $model_args \
+        --model_args "$model_args" \
         --tasks $benchmark \
         --batch_size 1 \
         --log_samples \

@@ -14,6 +14,9 @@ except ImportError:  # pragma: no cover - handled during model init
     LLM = None
     SamplingParams = None
 
+from vllm import LLM, SamplingParams
+from transformers import AutoProcessor, AutoTokenizer
+
 from lmms_eval.api.instance import Instance
 from lmms_eval.api.model import lmms
 from lmms_eval.api.registry import register_model

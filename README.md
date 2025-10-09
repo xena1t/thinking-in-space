@@ -119,6 +119,19 @@ question-answer pairs from the
 [nyu-visionx/VSI-Bench](https://huggingface.co/datasets/nyu-visionx/VSI-Bench)
 dataset via 🤗 Datasets, so no extra preprocessing is required.
 
+The Qwen3-VL wrapper relies on [vLLM](https://github.com/vllm-project/vllm) for
+generation. Install it in your evaluation environment first, for example:
+
+```bash
+pip install "vllm>=0.5.4"
+```
+
+vLLM expects the multiprocessing start method to be `spawn` when CUDA is in use.
+The integration configures this automatically, but if you run custom Python
+snippets before launching the benchmark make sure you have not already created
+CUDA tensors under the default `fork` context. Restarting the shell or exporting
+`VLLM_WORKER_MULTIPROC_METHOD=spawn` ahead of time avoids that pitfall.
+
 Once the dependencies are ready you can launch the evaluation with
 
 ```bash

@@ -801,6 +801,21 @@ class ConfigurableTask(Task):
         download_config.num_proc = dataset_kwargs.get("num_proc", 8) if dataset_kwargs is not None else 8
         download_config.local_files_only = dataset_kwargs.get("local_files_only", False) if dataset_kwargs is not None else False
         if dataset_kwargs is not None:
+            dataset_kwargs = dataset_kwargs.copy()
+
+            def _normalize_glob_patterns(data):
+                if isinstance(data, str):
+                    return re.sub(r"\*\*\.(?=[^/])", "**/*.", data)
+                if isinstance(data, Mapping):
+                    return {k: _normalize_glob_patterns(v) for k, v in data.items()}
+                if isinstance(data, (list, tuple)):
+                    normalized = [_normalize_glob_patterns(v) for v in data]
+                    return type(data)(normalized)
+                return data
+
+            if "data_files" in dataset_kwargs:
+                dataset_kwargs["data_files"] = _normalize_glob_patterns(dataset_kwargs["data_files"])
+
             if "From_YouTube" in dataset_kwargs:
 
                 def _download_from_youtube(path):

@@ -1,8 +1,19 @@
+import multiprocessing as mp
 import os
 import sys
 from typing import Dict, List, Optional, Tuple
 
 from tqdm import tqdm
+from transformers import AutoProcessor, AutoTokenizer
+
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
+try:  # pragma: no cover - optional dependency that is validated at runtime
+    from vllm import LLM, SamplingParams
+except ImportError:  # pragma: no cover - handled during model init
+    LLM = None
+    SamplingParams = None
+
 from vllm import LLM, SamplingParams
 from transformers import AutoProcessor, AutoTokenizer
 
@@ -40,6 +51,12 @@ class Qwen3VL(lmms):
     ):
         super().__init__()
 
+        if LLM is None or SamplingParams is None:
+            raise ImportError(
+                "vLLM is required for the Qwen3-VL backend. Install it with "
+                "`pip install vllm>=0.5.4` before launching the evaluation."
+            )
+
         repo_root = os.getenv("QWEN3_VL_REPO", "Qwen3-VL")
         utils_path = os.path.join(repo_root, "qwen-vl-utils", "src")
         if os.path.isdir(repo_root) and repo_root not in sys.path:
@@ -70,6 +87,7 @@ class Qwen3VL(lmms):
         # overridden through `vllm_kwargs` when necessary.
         vllm_kwargs.setdefault("trust_remote_code", True)
 
+        self._ensure_spawn_start_method()
         self._model = LLM(self.path, **vllm_kwargs)
         self._processor = AutoProcessor.from_pretrained(self.path, trust_remote_code=True)
         self._tokenizer = AutoTokenizer.from_pretrained(self.path, trust_remote_code=True)
@@ -90,6 +108,19 @@ class Qwen3VL(lmms):
 
         self.modality = modality
         self.max_frames_num = max_frames_num
+
+    @staticmethod
+    def _ensure_spawn_start_method() -> None:
+        method = mp.get_start_method(allow_none=True)
+        if method != "spawn":
+            try:
+                mp.set_start_method("spawn", force=True)
+            except RuntimeError as exc:  # pragma: no cover - defensive programming
+                raise RuntimeError(
+                    "Qwen3VL requires the multiprocessing start method to be 'spawn'. "
+                    "Please restart the program and ensure no CUDA work happens before "
+                    "lmms_eval imports, or pre-set VLLM_WORKER_MULTIPROC_METHOD=spawn."
+                ) from exc
 
     @property
     def config(self):

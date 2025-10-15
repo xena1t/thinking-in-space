@@ -5,7 +5,6 @@ import itertools
 import json
 import os
 import random
-import re
 import shutil
 import subprocess
 from collections.abc import Callable
@@ -803,9 +802,13 @@ class ConfigurableTask(Task):
         if dataset_kwargs is not None:
             dataset_kwargs = dataset_kwargs.copy()
 
+            # --- Begin glob normalization for HF/fsspec ---
+            # Newer fsspec/HF require the double-star to be an entire path component.
+            # Invalid: "**.jsonl"  Valid: "**/*.jsonl"
+            # Normalize any "**.ext" to "**/*.ext" recursively in data_files before calling load_dataset.
             def _normalize_glob_patterns(data):
                 if isinstance(data, str):
-                    return re.sub(r"\*\*\.(?=[^/])", "**/*.", data)
+                    return data.replace("**.", "**/*.")
                 if isinstance(data, Mapping):
                     return {k: _normalize_glob_patterns(v) for k, v in data.items()}
                 if isinstance(data, (list, tuple)):
@@ -815,6 +818,7 @@ class ConfigurableTask(Task):
 
             if "data_files" in dataset_kwargs:
                 dataset_kwargs["data_files"] = _normalize_glob_patterns(dataset_kwargs["data_files"])
+            # --- End glob normalization ---
 
             if "From_YouTube" in dataset_kwargs:
 

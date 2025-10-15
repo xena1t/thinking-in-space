@@ -5,7 +5,6 @@ import itertools
 import json
 import os
 import random
-import re
 import shutil
 import subprocess
 from collections.abc import Callable
@@ -803,18 +802,28 @@ class ConfigurableTask(Task):
         if dataset_kwargs is not None:
             dataset_kwargs = dataset_kwargs.copy()
 
-            def _normalize_glob_patterns(data):
-                if isinstance(data, str):
-                    return re.sub(r"\*\*\.(?=[^/])", "**/*.", data)
-                if isinstance(data, Mapping):
-                    return {k: _normalize_glob_patterns(v) for k, v in data.items()}
-                if isinstance(data, (list, tuple)):
-                    normalized = [_normalize_glob_patterns(v) for v in data]
-                    return type(data)(normalized)
-                return data
+            # --- Begin glob normalization for HF/fsspec ---
+            # Root cause of your crash:
+            #   ValueError: Invalid pattern: '**' can only be an entire path component
+            # is raised when data_files contain patterns like "**.jsonl" (invalid).
+            # Modern fsspec requires "**/*.jsonl" instead.
+            #
+            # Fix: rewrite any "**.ext" -> "**/*.ext" recursively before calling HF Datasets.
+            def _fix_double_star_globs(value):
+                if isinstance(value, str):
+                    # Only rewrite the illegal form "**.ext" to the legal "**/*.ext"
+                    return value.replace("**.", "**/*.")
+                if isinstance(value, Mapping):
+                    return {k: _fix_double_star_globs(v) for k, v in value.items()}
+                if isinstance(value, list):
+                    return [_fix_double_star_globs(v) for v in value]
+                if isinstance(value, tuple):
+                    return tuple(_fix_double_star_globs(v) for v in value)
+                return value
 
             if "data_files" in dataset_kwargs:
-                dataset_kwargs["data_files"] = _normalize_glob_patterns(dataset_kwargs["data_files"])
+                dataset_kwargs["data_files"] = _fix_double_star_globs(dataset_kwargs["data_files"])
+            # --- End glob normalization ---
 
             if "From_YouTube" in dataset_kwargs:
 

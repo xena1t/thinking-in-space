@@ -5,7 +5,6 @@ import itertools
 import json
 import os
 import random
-import re
 import shutil
 import subprocess
 from copy import deepcopy

@@ -4,10 +4,11 @@ import inspect
 import itertools
 import json
 import os
-import random
 import re
+import random
 import shutil
 import subprocess
+from copy import deepcopy
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from glob import glob
@@ -800,21 +801,37 @@ class ConfigurableTask(Task):
         download_config.max_retries = dataset_kwargs.get("max_retries", 10) if dataset_kwargs is not None else 10
         download_config.num_proc = dataset_kwargs.get("num_proc", 8) if dataset_kwargs is not None else 8
         download_config.local_files_only = dataset_kwargs.get("local_files_only", False) if dataset_kwargs is not None else False
+        # --- Begin robust glob normalization for HF/fsspec ---
+        # Ensure every '**' is a full path component for fsspec.
+        # Valid examples after normalization include:
+        #   "**/*.parquet", "foo/**/bar", "/**/*.jsonl", "dir/**"
+
+        def _normalize_double_star_component(value: str) -> str:
+            # 1) If '**' is preceded by a non-slash (e.g., 'foo**/bar'), insert a slash before: 'foo/**/bar'
+            value = re.sub(r"(?<!^)(?<!/)\*\*", r"/**", value)
+            # 2) If '**' is followed by a non-slash and not at the end (e.g., '**.parquet' or '/**data'),
+            #    insert '/*' after: '**/*.parquet' or '/**/*data'
+            value = re.sub(r"\*\*(?!/|$)", r"**/*", value)
+            # 3) Collapse multi-slash runs created above, while keeping schemes like 'hf://'
+            value = re.sub(r"(?<!:)/{2,}", "/", value)
+            return value
+
+        def _sanitize_globs(value):
+            if isinstance(value, str):
+                return _normalize_double_star_component(value)
+            if isinstance(value, Mapping):
+                return {k: _sanitize_globs(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [_sanitize_globs(v) for v in value]
+            if isinstance(value, tuple):
+                return tuple(_sanitize_globs(v) for v in value)
+            return value
+
         if dataset_kwargs is not None:
-            dataset_kwargs = dataset_kwargs.copy()
+            dataset_kwargs = _sanitize_globs(deepcopy(dataset_kwargs))
+        # --- End robust glob normalization ---
 
-            def _normalize_glob_patterns(data):
-                if isinstance(data, str):
-                    return re.sub(r"\*\*\.(?=[^/])", "**/*.", data)
-                if isinstance(data, Mapping):
-                    return {k: _normalize_glob_patterns(v) for k, v in data.items()}
-                if isinstance(data, (list, tuple)):
-                    normalized = [_normalize_glob_patterns(v) for v in data]
-                    return type(data)(normalized)
-                return data
-
-            if "data_files" in dataset_kwargs:
-                dataset_kwargs["data_files"] = _normalize_glob_patterns(dataset_kwargs["data_files"])
+        if dataset_kwargs is not None:
 
             if "From_YouTube" in dataset_kwargs:
 
@@ -838,8 +855,8 @@ class ConfigurableTask(Task):
                 if accelerator.is_main_process:
                     dataset_kwargs.pop("From_YouTube")
                     self.all_dataset = datasets.load_dataset(
-                        path=self.DATASET_PATH,
-                        name=self.DATASET_NAME,
+                        path=_sanitize_globs(self.DATASET_PATH),
+                        name=_sanitize_globs(self.DATASET_NAME),
                         download_mode=datasets.DownloadMode.REUSE_DATASET_IF_EXISTS,
                         **dataset_kwargs if dataset_kwargs is not None else {},
                     )
@@ -964,13 +981,36 @@ class ConfigurableTask(Task):
             if "local_files_only" in dataset_kwargs:
                 dataset_kwargs.pop("local_files_only")
 
-        self.dataset = datasets.load_dataset(
-            path=self.DATASET_PATH,
-            name=self.DATASET_NAME,
-            download_mode=datasets.DownloadMode.REUSE_DATASET_IF_EXISTS,
-            download_config=download_config,
-            **dataset_kwargs if dataset_kwargs is not None else {},
-        )
+        sanitized_path = None
+        sanitized_name = None
+        try:
+            sanitized_path = _sanitize_globs(self.DATASET_PATH) if self.DATASET_PATH is not None else None
+            sanitized_name = _sanitize_globs(self.DATASET_NAME) if self.DATASET_NAME is not None else None
+            self.dataset = datasets.load_dataset(
+                path=sanitized_path,
+                name=sanitized_name,
+                download_mode=datasets.DownloadMode.REUSE_DATASET_IF_EXISTS,
+                download_config=download_config,
+                **(dataset_kwargs if dataset_kwargs is not None else {}),
+            )
+        except ValueError as e:
+            msg = str(e)
+            if (
+                "Invalid pattern: '**' can only be an entire path component" in msg
+                and dataset_kwargs is not None
+            ):
+                if "data_files" in dataset_kwargs and dataset_kwargs["data_files"] is not None:
+                    dataset_kwargs["data_files"] = _sanitize_globs(dataset_kwargs["data_files"])
+                dataset_kwargs = _sanitize_globs(dataset_kwargs)
+                self.dataset = datasets.load_dataset(
+                    path=sanitized_path,
+                    name=sanitized_name,
+                    download_mode=datasets.DownloadMode.REUSE_DATASET_IF_EXISTS,
+                    download_config=download_config,
+                    **dataset_kwargs,
+                )
+            else:
+                raise
         if self.config.process_docs is not None:
             for split in self.dataset:
                 if split in [self.config.training_split, self.config.validation_split, self.config.test_split, self.config.fewshot_split]:

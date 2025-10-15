@@ -4,6 +4,7 @@ import inspect
 import itertools
 import json
 import os
+import re
 import random
 import shutil
 import subprocess
@@ -801,26 +802,19 @@ class ConfigurableTask(Task):
         download_config.num_proc = dataset_kwargs.get("num_proc", 8) if dataset_kwargs is not None else 8
         download_config.local_files_only = dataset_kwargs.get("local_files_only", False) if dataset_kwargs is not None else False
         # --- Begin robust glob normalization for HF/fsspec ---
-        # Root cause:
-        #   ValueError: Invalid pattern: '**' can only be an entire path component
-        # fsspec requires '**' to be followed by a slash (i.e., '**/').
-        # Offenders include patterns like "**.jsonl", "videos/**.mp4", or bare '**'.
-        # We normalize any '**' that is not immediately followed by '/' into '**/*'
-        # across nested structures before delegating to datasets.load_dataset.
+        # Ensure every '**' is a full path component for fsspec.
+        # Valid examples after normalization include:
+        #   "**/*.parquet", "foo/**/bar", "/**/*.jsonl", "dir/**"
 
         def _normalize_double_star_component(value: str) -> str:
-            # Safety net: local import prevents NameError even if top-level imports change.
-            import re as _re
-
-            # Iteratively repair patterns like '**.jsonl' until all stray '**' segments
-            # gain a trailing slash component (e.g., '**.jsonl' -> '**/*.jsonl').
-            # A single pass can leave new violations ("***.json" -> "**/**.json"),
-            # so keep normalizing until the string stabilizes.
-            while True:
-                normalized = _re.sub(r"\*\*(?!/)", "**/*", value)
-                if normalized == value:
-                    return normalized
-                value = normalized
+            # 1) If '**' is preceded by a non-slash (e.g., 'foo**/bar'), insert a slash before: 'foo/**/bar'
+            value = re.sub(r"(?<!^)(?<!/)\*\*", r"/**", value)
+            # 2) If '**' is followed by a non-slash and not at the end (e.g., '**.parquet' or '/**data'),
+            #    insert '/*' after: '**/*.parquet' or '/**/*data'
+            value = re.sub(r"\*\*(?!/|$)", r"**/*", value)
+            # 3) Collapse multi-slash runs created above, while keeping schemes like 'hf://'
+            value = re.sub(r"(?<!:)/{2,}", "/", value)
+            return value
 
         def _sanitize_globs(value):
             if isinstance(value, str):

@@ -804,13 +804,12 @@ class ConfigurableTask(Task):
         # Root cause:
         #   ValueError: Invalid pattern: '**' can only be an entire path component
         # fsspec requires '**' to be followed by a slash (i.e., '**/').
-        # Offenders include patterns like "**.jsonl", "videos/**.mp4", or "**foo".
-        # We normalize ANY '**' not followed by '/' into '**/*' across nested structures.
+        # Offenders include patterns like "**.jsonl", "videos/**.mp4", or bare '**'.
+        # We normalize any '**' that is not immediately followed by '/' into '**/*'
+        # across nested structures before delegating to datasets.load_dataset.
 
-        def _normalize_double_star_component(s: str) -> str:
-            # Replace occurrences of '**' that are NOT immediately followed by '/'
-            # with '**/*' so '**.jsonl' -> '**/*.jsonl', 'dir/**.parquet' -> 'dir/**/*.parquet', '**' -> '**/*'
-            return re.sub(r"\*\*(?!/)", "**/*", s)
+        def _normalize_double_star_component(value: str) -> str:
+            return re.sub(r"\*\*(?!/)", "**/*", value)
 
         def _sanitize_globs(value):
             if isinstance(value, str):
@@ -824,9 +823,7 @@ class ConfigurableTask(Task):
             return value
 
         if dataset_kwargs is not None:
-            dataset_kwargs = deepcopy(dataset_kwargs)
-            if "data_files" in dataset_kwargs and dataset_kwargs["data_files"] is not None:
-                dataset_kwargs["data_files"] = _sanitize_globs(dataset_kwargs["data_files"])
+            dataset_kwargs = _sanitize_globs(deepcopy(dataset_kwargs))
         # --- End robust glob normalization ---
 
         if dataset_kwargs is not None:
@@ -853,8 +850,8 @@ class ConfigurableTask(Task):
                 if accelerator.is_main_process:
                     dataset_kwargs.pop("From_YouTube")
                     self.all_dataset = datasets.load_dataset(
-                        path=self.DATASET_PATH,
-                        name=self.DATASET_NAME,
+                        path=_sanitize_globs(self.DATASET_PATH),
+                        name=_sanitize_globs(self.DATASET_NAME),
                         download_mode=datasets.DownloadMode.REUSE_DATASET_IF_EXISTS,
                         **dataset_kwargs if dataset_kwargs is not None else {},
                     )
@@ -979,10 +976,14 @@ class ConfigurableTask(Task):
             if "local_files_only" in dataset_kwargs:
                 dataset_kwargs.pop("local_files_only")
 
+        sanitized_path = None
+        sanitized_name = None
         try:
+            sanitized_path = _sanitize_globs(self.DATASET_PATH) if self.DATASET_PATH is not None else None
+            sanitized_name = _sanitize_globs(self.DATASET_NAME) if self.DATASET_NAME is not None else None
             self.dataset = datasets.load_dataset(
-                path=self.DATASET_PATH,
-                name=self.DATASET_NAME,
+                path=sanitized_path,
+                name=sanitized_name,
                 download_mode=datasets.DownloadMode.REUSE_DATASET_IF_EXISTS,
                 download_config=download_config,
                 **(dataset_kwargs if dataset_kwargs is not None else {}),
@@ -997,8 +998,8 @@ class ConfigurableTask(Task):
                     dataset_kwargs["data_files"] = _sanitize_globs(dataset_kwargs["data_files"])
                 dataset_kwargs = _sanitize_globs(dataset_kwargs)
                 self.dataset = datasets.load_dataset(
-                    path=self.DATASET_PATH,
-                    name=self.DATASET_NAME,
+                    path=sanitized_path,
+                    name=sanitized_name,
                     download_mode=datasets.DownloadMode.REUSE_DATASET_IF_EXISTS,
                     download_config=download_config,
                     **dataset_kwargs,

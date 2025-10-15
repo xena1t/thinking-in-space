@@ -7,6 +7,7 @@ import os
 import random
 import shutil
 import subprocess
+from copy import deepcopy
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from glob import glob
@@ -799,31 +800,36 @@ class ConfigurableTask(Task):
         download_config.max_retries = dataset_kwargs.get("max_retries", 10) if dataset_kwargs is not None else 10
         download_config.num_proc = dataset_kwargs.get("num_proc", 8) if dataset_kwargs is not None else 8
         download_config.local_files_only = dataset_kwargs.get("local_files_only", False) if dataset_kwargs is not None else False
+        # --- Begin robust glob normalization for HF/fsspec ---
+        # Root cause:
+        #   ValueError: Invalid pattern: '**' can only be an entire path component
+        # fsspec requires '**' to be followed by a slash (i.e., '**/').
+        # Offenders include patterns like "**.jsonl", "videos/**.mp4", or "**foo".
+        # We normalize ANY '**' not followed by '/' into '**/*' across nested structures.
+
+        def _normalize_double_star_component(s: str) -> str:
+            # Replace occurrences of '**' that are NOT immediately followed by '/'
+            # with '**/*' so '**.jsonl' -> '**/*.jsonl', 'dir/**.parquet' -> 'dir/**/*.parquet', '**' -> '**/*'
+            return re.sub(r"\*\*(?!/)", "**/*", s)
+
+        def _sanitize_globs(value):
+            if isinstance(value, str):
+                return _normalize_double_star_component(value)
+            if isinstance(value, Mapping):
+                return {k: _sanitize_globs(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [_sanitize_globs(v) for v in value]
+            if isinstance(value, tuple):
+                return tuple(_sanitize_globs(v) for v in value)
+            return value
+
         if dataset_kwargs is not None:
-            dataset_kwargs = dataset_kwargs.copy()
+            dataset_kwargs = deepcopy(dataset_kwargs)
+            if "data_files" in dataset_kwargs and dataset_kwargs["data_files"] is not None:
+                dataset_kwargs["data_files"] = _sanitize_globs(dataset_kwargs["data_files"])
+        # --- End robust glob normalization ---
 
-            # --- Begin glob normalization for HF/fsspec ---
-            # Root cause of your crash:
-            #   ValueError: Invalid pattern: '**' can only be an entire path component
-            # is raised when data_files contain patterns like "**.jsonl" (invalid).
-            # Modern fsspec requires "**/*.jsonl" instead.
-            #
-            # Fix: rewrite any "**.ext" -> "**/*.ext" recursively before calling HF Datasets.
-            def _fix_double_star_globs(value):
-                if isinstance(value, str):
-                    # Only rewrite the illegal form "**.ext" to the legal "**/*.ext"
-                    return value.replace("**.", "**/*.")
-                if isinstance(value, Mapping):
-                    return {k: _fix_double_star_globs(v) for k, v in value.items()}
-                if isinstance(value, list):
-                    return [_fix_double_star_globs(v) for v in value]
-                if isinstance(value, tuple):
-                    return tuple(_fix_double_star_globs(v) for v in value)
-                return value
-
-            if "data_files" in dataset_kwargs:
-                dataset_kwargs["data_files"] = _fix_double_star_globs(dataset_kwargs["data_files"])
-            # --- End glob normalization ---
+        if dataset_kwargs is not None:
 
             if "From_YouTube" in dataset_kwargs:
 
@@ -973,13 +979,32 @@ class ConfigurableTask(Task):
             if "local_files_only" in dataset_kwargs:
                 dataset_kwargs.pop("local_files_only")
 
-        self.dataset = datasets.load_dataset(
-            path=self.DATASET_PATH,
-            name=self.DATASET_NAME,
-            download_mode=datasets.DownloadMode.REUSE_DATASET_IF_EXISTS,
-            download_config=download_config,
-            **dataset_kwargs if dataset_kwargs is not None else {},
-        )
+        try:
+            self.dataset = datasets.load_dataset(
+                path=self.DATASET_PATH,
+                name=self.DATASET_NAME,
+                download_mode=datasets.DownloadMode.REUSE_DATASET_IF_EXISTS,
+                download_config=download_config,
+                **(dataset_kwargs if dataset_kwargs is not None else {}),
+            )
+        except ValueError as e:
+            msg = str(e)
+            if (
+                "Invalid pattern: '**' can only be an entire path component" in msg
+                and dataset_kwargs is not None
+            ):
+                if "data_files" in dataset_kwargs and dataset_kwargs["data_files"] is not None:
+                    dataset_kwargs["data_files"] = _sanitize_globs(dataset_kwargs["data_files"])
+                dataset_kwargs = _sanitize_globs(dataset_kwargs)
+                self.dataset = datasets.load_dataset(
+                    path=self.DATASET_PATH,
+                    name=self.DATASET_NAME,
+                    download_mode=datasets.DownloadMode.REUSE_DATASET_IF_EXISTS,
+                    download_config=download_config,
+                    **dataset_kwargs,
+                )
+            else:
+                raise
         if self.config.process_docs is not None:
             for split in self.dataset:
                 if split in [self.config.training_split, self.config.validation_split, self.config.test_split, self.config.fewshot_split]:

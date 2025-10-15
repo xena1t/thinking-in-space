@@ -809,7 +809,15 @@ class ConfigurableTask(Task):
         # across nested structures before delegating to datasets.load_dataset.
 
         def _normalize_double_star_component(value: str) -> str:
-            return re.sub(r"\*\*(?!/)", "**/*", value)
+            # Iteratively repair patterns like '**.jsonl' until all stray '**' segments
+            # gain a trailing slash component (e.g., '**.jsonl' -> '**/*.jsonl').
+            # A single pass can leave new violations ("***.json" -> "**/**.json"),
+            # so keep normalizing until the string stabilizes.
+            while True:
+                normalized = re.sub(r"\*\*(?!/)", "**/*", value)
+                if normalized == value:
+                    return normalized
+                value = normalized
 
         def _sanitize_globs(value):
             if isinstance(value, str):

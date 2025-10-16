@@ -69,12 +69,22 @@ ALL_OUTPUT_TYPES = [
 
 _DOUBLE_STAR_INVALID_RE = re.compile(r"\*\*(?!/|$)")
 
+_HF_GLOB_PATCHED = False
+
 
 def _normalize_double_star_component(value: str) -> str:
     """Ensure any '**' segment becomes a full path component for fsspec."""
     if not isinstance(value, str):
         return value
-    return _DOUBLE_STAR_INVALID_RE.sub("**/*", value)
+
+    normalized = value
+    while True:
+        updated = re.sub(r"(?<!^)(?<!/)\*\*", r"/**", normalized)
+        updated = _DOUBLE_STAR_INVALID_RE.sub("**/*", updated)
+        if updated == normalized:
+            break
+        normalized = updated
+    return normalized
 
 
 def _sanitize_globs(value):
@@ -88,6 +98,35 @@ def _sanitize_globs(value):
     if isinstance(value, str):
         return _normalize_double_star_component(value)
     return value
+
+
+def _patch_hf_hub_glob() -> None:
+    """Monkey-patch Hugging Face's fsspec glob to fix invalid ``**`` patterns."""
+
+    global _HF_GLOB_PATCHED
+
+    if _HF_GLOB_PATCHED:
+        return
+
+    try:
+        from huggingface_hub.hf_file_system import HfFileSystem
+    except ImportError:  # pragma: no cover - optional dependency
+        return
+
+    if getattr(HfFileSystem, "_lmms_eval_glob_patched", False):
+        _HF_GLOB_PATCHED = True
+        return
+
+    original_glob = HfFileSystem.glob
+
+    def _patched_glob(self, path, *args, **kwargs):
+        sanitized_path = _normalize_double_star_component(path) if isinstance(path, str) else path
+        return original_glob(self, sanitized_path, *args, **kwargs)
+
+    HfFileSystem.glob = _patched_glob  # type: ignore[assignment]
+    setattr(HfFileSystem, "_lmms_eval_glob_patched", True)
+    setattr(HfFileSystem, "_lmms_eval_original_glob", original_glob)
+    _HF_GLOB_PATCHED = True
 
 
 @dataclass
@@ -1004,6 +1043,8 @@ class ConfigurableTask(Task):
                 load_kwargs,
             )
         )
+
+        _patch_hf_hub_glob()
 
         try:
             self.dataset = datasets.load_dataset(

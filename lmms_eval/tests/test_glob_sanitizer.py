@@ -140,6 +140,26 @@ if "sacrebleu" not in sys.modules:
     sacrebleu_stub.corpus_bleu = corpus_bleu
     sys.modules["sacrebleu"] = sacrebleu_stub
 
+try:  # pragma: no cover - prefer the real library when available
+    import huggingface_hub  # type: ignore
+    from huggingface_hub.hf_file_system import HfFileSystem  # type: ignore
+except Exception:  # pragma: no cover - minimal fallback stub
+    hf_stub = types.ModuleType("huggingface_hub")
+    hf_file_system_stub = types.ModuleType("huggingface_hub.hf_file_system")
+
+    class HfFileSystem:  # pragma: no cover - minimal stub, real behaviour tested below
+        def glob(self, path, *_, **__):
+            return [path]
+
+    class CommitInfo:  # pragma: no cover - placeholder to satisfy datasets imports
+        pass
+
+    hf_stub.CommitInfo = CommitInfo
+    hf_file_system_stub.HfFileSystem = HfFileSystem
+    hf_stub.hf_file_system = hf_file_system_stub
+    sys.modules["huggingface_hub"] = hf_stub
+    sys.modules["huggingface_hub.hf_file_system"] = hf_file_system_stub
+
 from lmms_eval.api import task as task_module
 from lmms_eval.tasks import _glob_sanitize, _glob_validate
 
@@ -153,6 +173,14 @@ def test_sanitize_glob_preserves_original_and_rewrites():
     assert original["data_files"]["train"] == "scannet/**.mp4"
 
 
+def test_sanitize_glob_inserts_missing_separator():
+    original = {"data_files": {"train": "bad**.mp4"}}
+    sanitized = task_module._sanitize_globs(original)
+
+    assert sanitized["data_files"]["train"] == "bad/**/*.mp4"
+    assert original["data_files"]["train"] == "bad**.mp4"
+
+
 def test_glob_validate_flags_invalid_patterns():
     bad_value = {"data_files": {"train": "bad/**video.mp4"}}
 
@@ -162,3 +190,29 @@ def test_glob_validate_flags_invalid_patterns():
     sanitized = _glob_sanitize(bad_value)
     # Validation should succeed once sanitized.
     _glob_validate(sanitized)
+
+
+def test_patch_hf_glob_sanitizes_paths(monkeypatch):
+    from huggingface_hub.hf_file_system import HfFileSystem
+
+    from lmms_eval.api import task as task_module
+
+    calls = []
+
+    def _original_glob(self, path, *args, **kwargs):
+        calls.append(path)
+        if path.endswith("**.mp4"):
+            raise ValueError("Invalid pattern: '**' can only be an entire path component")
+        return ["ok"]
+
+    monkeypatch.setattr(HfFileSystem, "glob", _original_glob, raising=False)
+    for attr in ("_lmms_eval_glob_patched", "_lmms_eval_original_glob"):
+        if hasattr(HfFileSystem, attr):
+            delattr(HfFileSystem, attr)
+    task_module._HF_GLOB_PATCHED = False
+
+    task_module._patch_hf_hub_glob()
+
+    fs = HfFileSystem()
+    assert fs.glob("videos/**.mp4") == ["ok"]
+    assert calls == ["videos/**/*.mp4"]

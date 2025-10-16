@@ -61,6 +61,26 @@ ALL_OUTPUT_TYPES = [
 ]
 
 
+def _normalize_double_star_component(value: str) -> str:
+    """Ensure any '**' segment is followed by '/' for fsspec compatibility."""
+    if not isinstance(value, str):
+        return value
+    return re.sub(r"\*\*(?!/)", "**/*", value)
+
+
+def _sanitize_globs(value):
+    """Recursively normalize glob patterns containing '**' to valid forms."""
+    if isinstance(value, Mapping):
+        return {k: _sanitize_globs(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_globs(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_sanitize_globs(v) for v in value)
+    if isinstance(value, str):
+        return _normalize_double_star_component(value)
+    return value
+
+
 @dataclass
 class TaskConfig(dict):
     # task naming/registry
@@ -801,35 +821,8 @@ class ConfigurableTask(Task):
         download_config.max_retries = dataset_kwargs.get("max_retries", 10) if dataset_kwargs is not None else 10
         download_config.num_proc = dataset_kwargs.get("num_proc", 8) if dataset_kwargs is not None else 8
         download_config.local_files_only = dataset_kwargs.get("local_files_only", False) if dataset_kwargs is not None else False
-        # --- Begin robust glob normalization for HF/fsspec ---
-        # Ensure every '**' is a full path component for fsspec.
-        # Valid examples after normalization include:
-        #   "**/*.parquet", "foo/**/bar", "/**/*.jsonl", "dir/**"
-
-        def _normalize_double_star_component(value: str) -> str:
-            # 1) If '**' is preceded by a non-slash (e.g., 'foo**/bar'), insert a slash before: 'foo/**/bar'
-            value = re.sub(r"(?<!^)(?<!/)\*\*", r"/**", value)
-            # 2) If '**' is followed by a non-slash and not at the end (e.g., '**.parquet' or '/**data'),
-            #    insert '/*' after: '**/*.parquet' or '/**/*data'
-            value = re.sub(r"\*\*(?!/|$)", r"**/*", value)
-            # 3) Collapse multi-slash runs created above, while keeping schemes like 'hf://'
-            value = re.sub(r"(?<!:)/{2,}", "/", value)
-            return value
-
-        def _sanitize_globs(value):
-            if isinstance(value, str):
-                return _normalize_double_star_component(value)
-            if isinstance(value, Mapping):
-                return {k: _sanitize_globs(v) for k, v in value.items()}
-            if isinstance(value, list):
-                return [_sanitize_globs(v) for v in value]
-            if isinstance(value, tuple):
-                return tuple(_sanitize_globs(v) for v in value)
-            return value
-
         if dataset_kwargs is not None:
             dataset_kwargs = _sanitize_globs(deepcopy(dataset_kwargs))
-        # --- End robust glob normalization ---
 
         if dataset_kwargs is not None:
 

@@ -173,6 +173,14 @@ def test_sanitize_glob_preserves_original_and_rewrites():
     assert original["data_files"]["train"] == "scannet/**.mp4"
 
 
+def test_sanitize_glob_inserts_missing_separator():
+    original = {"data_files": {"train": "bad**.mp4"}}
+    sanitized = task_module._sanitize_globs(original)
+
+    assert sanitized["data_files"]["train"] == "bad/**/*.mp4"
+    assert original["data_files"]["train"] == "bad**.mp4"
+
+
 def test_glob_validate_flags_invalid_patterns():
     bad_value = {"data_files": {"train": "bad/**video.mp4"}}
 

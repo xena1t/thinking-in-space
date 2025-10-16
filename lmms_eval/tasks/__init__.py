@@ -22,7 +22,15 @@ _DOUBLE_STAR_INVALID_RE = re.compile(r"\*\*(?!/|$)")
 def _normalize_glob_string(value: str) -> str:
     if not isinstance(value, str):
         return value
-    return _DOUBLE_STAR_INVALID_RE.sub("**/*", value)
+
+    normalized = value
+    while True:
+        updated = re.sub(r"(?<!^)(?<!/)\*\*", r"/**", normalized)
+        updated = _DOUBLE_STAR_INVALID_RE.sub("**/*", updated)
+        if updated == normalized:
+            break
+        normalized = updated
+    return normalized
 
 
 def _glob_sanitize(value):

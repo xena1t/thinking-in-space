@@ -76,7 +76,15 @@ def _normalize_double_star_component(value: str) -> str:
     """Ensure any '**' segment becomes a full path component for fsspec."""
     if not isinstance(value, str):
         return value
-    return _DOUBLE_STAR_INVALID_RE.sub("**/*", value)
+
+    normalized = value
+    while True:
+        updated = re.sub(r"(?<!^)(?<!/)\*\*", r"/**", normalized)
+        updated = _DOUBLE_STAR_INVALID_RE.sub("**/*", updated)
+        if updated == normalized:
+            break
+        normalized = updated
+    return normalized
 
 
 def _sanitize_globs(value):

@@ -32,7 +32,13 @@ from datasets import DownloadConfig, Image, Sequence
 from huggingface_hub import snapshot_download
 from loguru import logger as eval_logger
 from PIL import ImageFile
-from tenacity import retry, stop_after_attempt, stop_after_delay, wait_fixed
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    stop_after_delay,
+    wait_fixed,
+)
 from tqdm import tqdm
 
 from lmms_eval import utils
@@ -61,15 +67,18 @@ ALL_OUTPUT_TYPES = [
 ]
 
 
+_DOUBLE_STAR_INVALID_RE = re.compile(r"\*\*(?!/|$)")
+
+
 def _normalize_double_star_component(value: str) -> str:
-    """Ensure any '**' segment is followed by '/' for fsspec compatibility."""
+    """Ensure any '**' segment becomes a full path component for fsspec."""
     if not isinstance(value, str):
         return value
-    return re.sub(r"\*\*(?!/)", "**/*", value)
+    return _DOUBLE_STAR_INVALID_RE.sub("**/*", value)
 
 
 def _sanitize_globs(value):
-    """Recursively normalize glob patterns containing '**' to valid forms."""
+    """Return a sanitized copy of *value* with legal double-star glob usage."""
     if isinstance(value, Mapping):
         return {k: _sanitize_globs(v) for k, v in value.items()}
     if isinstance(value, list):
@@ -813,7 +822,11 @@ class ConfigurableTask(Task):
                     eval_logger.warning(f"[Task: {self._config.task}] metric {metric_name} is defined, but higher_is_better is not. " f"using default " f"higher_is_better={is_higher_better(metric_name)}")
                     self._higher_is_better[metric_name] = is_higher_better(metric_name)
 
-    @retry(stop=(stop_after_attempt(5) | stop_after_delay(60)), wait=wait_fixed(2))
+    @retry(
+        stop=(stop_after_attempt(5) | stop_after_delay(60)),
+        wait=wait_fixed(2),
+        retry=retry_if_exception_type((OSError, IOError, TimeoutError, ConnectionError)),
+    )
     def download(self, dataset_kwargs=None) -> None:
         # If the dataset is a video dataset,
         # Recursively search whether their is a zip and unzip it to the huggingface home
@@ -822,7 +835,7 @@ class ConfigurableTask(Task):
         download_config.num_proc = dataset_kwargs.get("num_proc", 8) if dataset_kwargs is not None else 8
         download_config.local_files_only = dataset_kwargs.get("local_files_only", False) if dataset_kwargs is not None else False
         if dataset_kwargs is not None:
-            dataset_kwargs = _sanitize_globs(deepcopy(dataset_kwargs))
+            dataset_kwargs = deepcopy(dataset_kwargs)
 
         if dataset_kwargs is not None:
 
@@ -974,36 +987,39 @@ class ConfigurableTask(Task):
             if "local_files_only" in dataset_kwargs:
                 dataset_kwargs.pop("local_files_only")
 
-        sanitized_path = None
-        sanitized_name = None
+        sanitized_path = _sanitize_globs(self.DATASET_PATH) if self.DATASET_PATH is not None else None
+        sanitized_name = _sanitize_globs(self.DATASET_NAME) if self.DATASET_NAME is not None else None
+        if dataset_kwargs is None:
+            load_kwargs = {}
+        else:
+            load_kwargs = _sanitize_globs(dataset_kwargs)
+            if not isinstance(load_kwargs, Mapping):
+                raise TypeError("dataset_kwargs must be a mapping of keyword arguments")
+
+        eval_logger.debug(
+            "[Task: {}] load_dataset with path={!r} name={!r} kwargs={}".format(
+                getattr(self.config, "task", None),
+                sanitized_path,
+                sanitized_name,
+                load_kwargs,
+            )
+        )
+
         try:
-            sanitized_path = _sanitize_globs(self.DATASET_PATH) if self.DATASET_PATH is not None else None
-            sanitized_name = _sanitize_globs(self.DATASET_NAME) if self.DATASET_NAME is not None else None
             self.dataset = datasets.load_dataset(
                 path=sanitized_path,
                 name=sanitized_name,
                 download_mode=datasets.DownloadMode.REUSE_DATASET_IF_EXISTS,
                 download_config=download_config,
-                **(dataset_kwargs if dataset_kwargs is not None else {}),
+                **load_kwargs,
             )
-        except ValueError as e:
-            msg = str(e)
-            if (
-                "Invalid pattern: '**' can only be an entire path component" in msg
-                and dataset_kwargs is not None
-            ):
-                if "data_files" in dataset_kwargs and dataset_kwargs["data_files"] is not None:
-                    dataset_kwargs["data_files"] = _sanitize_globs(dataset_kwargs["data_files"])
-                dataset_kwargs = _sanitize_globs(dataset_kwargs)
-                self.dataset = datasets.load_dataset(
-                    path=sanitized_path,
-                    name=sanitized_name,
-                    download_mode=datasets.DownloadMode.REUSE_DATASET_IF_EXISTS,
-                    download_config=download_config,
-                    **dataset_kwargs,
-                )
-            else:
-                raise
+        except ValueError as exc:
+            if _DOUBLE_STAR_INVALID_RE.search(str(exc)):
+                raise ValueError(
+                    "datasets.load_dataset rejected a '**' glob pattern after normalization. "
+                    "Please ensure task configuration uses '**/' as a full path component."
+                ) from exc
+            raise
         if self.config.process_docs is not None:
             for split in self.dataset:
                 if split in [self.config.training_split, self.config.validation_split, self.config.test_split, self.config.fewshot_split]:

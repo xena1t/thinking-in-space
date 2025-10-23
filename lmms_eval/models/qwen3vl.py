@@ -182,6 +182,7 @@ class Qwen3VL(lmms):
                 messages, tokenize=False, add_generation_prompt=True
             )
             _, video_inputs = self._process_vision_info(messages)
+            video_inputs = self._ensure_video_metadata(video_inputs)
             generated = self._model.generate(
                 {
                     "prompt": text,
@@ -194,6 +195,47 @@ class Qwen3VL(lmms):
             pbar.update(1)
         pbar.close()
         return res
+
+    @staticmethod
+    def _ensure_video_metadata(video_inputs):
+        """Fill in missing metadata dictionaries expected by vLLM's Qwen3 backend.
+
+        Qwen3's multimodal processor assumes every video payload includes a
+        ``metadata`` mapping. Older revisions of ``qwen-vl-utils`` may return
+        ``None`` for this field, which leads to ``AttributeError`` inside
+        vLLM's sampling utilities.  To remain compatible with those versions we
+        recursively replace ``None`` metadata entries with empty dictionaries
+        and leave any existing metadata untouched.
+        """
+
+        if isinstance(video_inputs, dict):
+            # Dictionaries that describe a single clip usually contain either a
+            # ``video`` key or an explicit ``metadata`` field. In that case we
+            # normalize the metadata in-place instead of recursing into each
+            # scalar entry.
+            if any(key in video_inputs for key in ("video", "image", "metadata")):
+                normalized = dict(video_inputs)
+                metadata = normalized.get("metadata")
+                if metadata is None:
+                    normalized["metadata"] = {}
+                elif not isinstance(metadata, dict):
+                    try:
+                        normalized["metadata"] = dict(metadata)
+                    except TypeError:
+                        normalized["metadata"] = {}
+                # Guarantee the key the backend probes exists.
+                normalized["metadata"].setdefault("do_sample_frames", True)
+                return normalized
+
+            return {k: Qwen3VL._ensure_video_metadata(v) for k, v in video_inputs.items()}
+
+        if isinstance(video_inputs, list):
+            return [Qwen3VL._ensure_video_metadata(item) for item in video_inputs]
+
+        if isinstance(video_inputs, tuple):
+            return tuple(Qwen3VL._ensure_video_metadata(item) for item in video_inputs)
+
+        return video_inputs
 
     def loglikelihood(self, requests: List[Instance]) -> List[Tuple[float, bool]]:
         raise NotImplementedError("Log-likelihood computation is not implemented for Qwen3VL.")

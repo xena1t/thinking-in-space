@@ -205,35 +205,43 @@ class Qwen3VL(lmms):
         ``None`` for this field, which leads to ``AttributeError`` inside
         vLLM's sampling utilities.  To remain compatible with those versions we
         recursively replace ``None`` metadata entries with empty dictionaries
-        and leave any existing metadata untouched.
+        and leave any existing metadata untouched.  The helper also understands
+        generic mapping/sequence containers returned by ``transformers`` so we
+        handle ``BatchFeature`` objects in addition to vanilla ``dict``/``list``.
         """
 
-        if isinstance(video_inputs, dict):
-            # Dictionaries that describe a single clip usually contain either a
-            # ``video`` key or an explicit ``metadata`` field. In that case we
-            # normalize the metadata in-place instead of recursing into each
-            # scalar entry.
-            if any(key in video_inputs for key in ("video", "image", "metadata")):
-                normalized = dict(video_inputs)
-                metadata = normalized.get("metadata")
-                if metadata is None:
-                    normalized["metadata"] = {}
-                elif not isinstance(metadata, dict):
-                    try:
-                        normalized["metadata"] = dict(metadata)
-                    except TypeError:
-                        normalized["metadata"] = {}
-                # Guarantee the key the backend probes exists.
-                normalized["metadata"].setdefault("do_sample_frames", True)
-                return normalized
+        from collections.abc import Mapping, Sequence
 
-            return {k: Qwen3VL._ensure_video_metadata(v) for k, v in video_inputs.items()}
+        def _coerce_metadata(value):
+            if value is None:
+                metadata_dict = {}
+            elif isinstance(value, Mapping):
+                metadata_dict = dict(value)
+            else:
+                try:
+                    metadata_dict = dict(value)
+                except TypeError:
+                    metadata_dict = {}
+            metadata_dict.setdefault("do_sample_frames", True)
+            return metadata_dict
+
+        if video_inputs is None:
+            return {"metadata": {"do_sample_frames": True}}
+
+        if isinstance(video_inputs, Mapping):
+            normalized = {k: Qwen3VL._ensure_video_metadata(v) for k, v in video_inputs.items()}
+            if any(key in normalized for key in ("video", "image", "metadata")):
+                normalized["metadata"] = _coerce_metadata(normalized.get("metadata"))
+            return normalized
 
         if isinstance(video_inputs, list):
             return [Qwen3VL._ensure_video_metadata(item) for item in video_inputs]
 
         if isinstance(video_inputs, tuple):
             return tuple(Qwen3VL._ensure_video_metadata(item) for item in video_inputs)
+
+        if isinstance(video_inputs, Sequence) and not isinstance(video_inputs, (str, bytes, bytearray)):
+            return [Qwen3VL._ensure_video_metadata(item) for item in video_inputs]
 
         return video_inputs
 

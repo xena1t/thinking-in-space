@@ -201,9 +201,18 @@ def test_patch_hf_glob_sanitizes_paths(monkeypatch):
 
     def _original_glob(self, path, *args, **kwargs):
         calls.append(path)
-        if path.endswith("**.mp4"):
-            raise ValueError("Invalid pattern: '**' can only be an entire path component")
-        return ["ok"]
+
+        def _check(value: str):
+            if value.endswith("**.mp4"):
+                raise ValueError("Invalid pattern: '**' can only be an entire path component")
+
+        if isinstance(path, (list, tuple)):
+            for item in path:
+                _check(item)
+            return ["ok-list"]
+
+        _check(path)
+        return ["ok-str"]
 
     monkeypatch.setattr(HfFileSystem, "glob", _original_glob, raising=False)
     for attr in ("_lmms_eval_glob_patched", "_lmms_eval_original_glob"):
@@ -214,5 +223,9 @@ def test_patch_hf_glob_sanitizes_paths(monkeypatch):
     task_module._patch_hf_hub_glob()
 
     fs = HfFileSystem()
-    assert fs.glob("videos/**.mp4") == ["ok"]
-    assert calls == ["videos/**/*.mp4"]
+    assert fs.glob("videos/**.mp4") == ["ok-str"]
+    assert fs.glob(["videos/**.mp4", "images/**.jpg"]) == ["ok-list"]
+    assert calls == [
+        "videos/**/*.mp4",
+        ["videos/**/*.mp4", "images/**/*.jpg"],
+    ]

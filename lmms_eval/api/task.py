@@ -120,13 +120,16 @@ def _patch_hf_hub_glob() -> None:
     original_glob = HfFileSystem.glob
 
     def _patched_glob(self, path, *args, **kwargs):
-        sanitized_path = _normalize_double_star_component(path) if isinstance(path, str) else path
+        sanitized_path = _sanitize_globs(path)
         return original_glob(self, sanitized_path, *args, **kwargs)
 
     HfFileSystem.glob = _patched_glob  # type: ignore[assignment]
     setattr(HfFileSystem, "_lmms_eval_glob_patched", True)
     setattr(HfFileSystem, "_lmms_eval_original_glob", original_glob)
     _HF_GLOB_PATCHED = True
+
+
+_patch_hf_hub_glob()
 
 
 @dataclass

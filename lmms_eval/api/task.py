@@ -119,9 +119,66 @@ def _patch_hf_hub_glob() -> None:
 
     original_glob = HfFileSystem.glob
 
+    def _generate_double_star_variants(original_pattern: str) -> list[str]:
+        """Return additional patterns that capture root-level matches for ``**.ext`` forms."""
+
+        variants: list[str] = []
+
+        if "**." in original_pattern:
+            # Replace the illegal "**." fragment with a single-level wildcard so files
+            # that live directly under the prefix continue to match.
+            variants.append(original_pattern.replace("**.", "*."))
+
+        if original_pattern.endswith("/**"):
+            variants.append(original_pattern[:-3] + "/*")
+
+        # Ensure we only return unique, non-empty patterns.
+        deduped: list[str] = []
+        for candidate in variants:
+            if candidate and candidate not in deduped:
+                deduped.append(candidate)
+        return deduped
+
     def _patched_glob(self, path, *args, **kwargs):
-        sanitized_path = _sanitize_globs(path)
-        return original_glob(self, sanitized_path, *args, **kwargs)
+        try:
+            return original_glob(self, path, *args, **kwargs)
+        except ValueError as exc:
+            if not (
+                isinstance(path, (str, list, tuple))
+                and (
+                    _DOUBLE_STAR_INVALID_RE.search(str(exc))
+                    or (isinstance(path, str) and _DOUBLE_STAR_INVALID_RE.search(path))
+                )
+            ):
+                raise
+
+            sanitized_path = _sanitize_globs(path)
+            try:
+                results = original_glob(self, sanitized_path, *args, **kwargs)
+            except ValueError:
+                # If sanitizing did not produce a valid pattern we surface the original error.
+                raise exc
+
+            if isinstance(path, str) and isinstance(sanitized_path, str):
+                extra_patterns = _generate_double_star_variants(path)
+                if extra_patterns:
+                    aggregated = list(results)
+                    for alt in extra_patterns:
+                        try:
+                            aggregated.extend(original_glob(self, alt, *args, **kwargs))
+                        except ValueError:
+                            continue
+                    if aggregated:
+                        # Avoid duplicate paths while preserving stable ordering.
+                        seen = set()
+                        unique_results = []
+                        for item in aggregated:
+                            if item not in seen:
+                                seen.add(item)
+                                unique_results.append(item)
+                        return unique_results
+
+            return results
 
     HfFileSystem.glob = _patched_glob  # type: ignore[assignment]
     setattr(HfFileSystem, "_lmms_eval_glob_patched", True)
@@ -130,6 +187,62 @@ def _patch_hf_hub_glob() -> None:
 
 
 _patch_hf_hub_glob()
+
+
+def _load_dataset_from_snapshot_parquet(
+    *,
+    repo_id: str,
+    snapshot_path: str,
+    load_kwargs: Mapping[str, Any],
+    download_config: DownloadConfig,
+    download_mode: datasets.DownloadMode,
+    split_preference: Iterable[Optional[str]],
+):
+    """Load a parquet dataset directly from a downloaded snapshot.
+
+    When Hugging Face Datasets cannot infer the proper loader for a repo (for
+    example due to strict fsspec glob validation), we fall back to scanning the
+    snapshot for parquet shards and load them explicitly.
+    """
+
+    snapshot_path = os.path.abspath(snapshot_path)
+    parquet_files = sorted(glob(os.path.join(snapshot_path, "**", "*.parquet"), recursive=True))
+    if not parquet_files:
+        raise FileNotFoundError(f"No parquet files found in snapshot for {repo_id}")
+
+    preference: List[str] = [split for split in split_preference if split]
+    default_split = preference[0] if preference else "train"
+
+    def infer_split(path: str) -> str:
+        lower = os.path.basename(path).lower()
+        if "train" in lower:
+            return "train"
+        if "validation" in lower or "val" in lower or "dev" in lower:
+            return "validation"
+        if "test" in lower:
+            return "test"
+        return default_split
+
+    data_files: Dict[str, List[str]] = {}
+    for parquet_path in parquet_files:
+        split_name = infer_split(parquet_path)
+        data_files.setdefault(split_name, []).append(parquet_path)
+
+    sorted_data_files = {split: sorted(paths) for split, paths in data_files.items()}
+
+    parquet_kwargs = {
+        key: value
+        for key, value in load_kwargs.items()
+        if key not in {"token", "data_files"}
+    }
+    parquet_kwargs["data_files"] = sorted_data_files
+
+    return datasets.load_dataset(
+        "parquet",
+        download_config=download_config,
+        download_mode=download_mode,
+        **parquet_kwargs,
+    )
 
 
 @dataclass
@@ -879,6 +992,32 @@ class ConfigurableTask(Task):
         if dataset_kwargs is not None:
             dataset_kwargs = deepcopy(dataset_kwargs)
 
+        repo_id_for_snapshot = self.DATASET_PATH if isinstance(self.DATASET_PATH, str) else None
+        cache_path: Optional[str] = None
+        token_value = dataset_kwargs.get("token") if dataset_kwargs is not None else None
+
+        def _ensure_snapshot(existing: Optional[str], **overrides) -> Optional[str]:
+            if existing is not None or repo_id_for_snapshot is None:
+                return existing
+
+            snapshot_kwargs = {
+                "repo_id": repo_id_for_snapshot,
+                "repo_type": "dataset",
+                "local_files_only": download_config.local_files_only,
+            }
+
+            if dataset_kwargs is not None and "revision" in dataset_kwargs:
+                snapshot_kwargs["revision"] = dataset_kwargs["revision"]
+
+            if isinstance(token_value, str):
+                snapshot_kwargs["token"] = token_value
+            elif token_value not in (None, False, True):
+                snapshot_kwargs["token"] = token_value
+
+            snapshot_kwargs.update(overrides)
+
+            return snapshot_download(**snapshot_kwargs)
+
         if dataset_kwargs is not None:
 
             if "From_YouTube" in dataset_kwargs:
@@ -909,7 +1048,7 @@ class ConfigurableTask(Task):
                         **dataset_kwargs if dataset_kwargs is not None else {},
                     )
                     dataset_kwargs["From_YouTube"] = True
-                    cache_path = snapshot_download(repo_id=self.DATASET_PATH, repo_type="dataset")  # download_parquet
+                    cache_path = _ensure_snapshot(cache_path)  # download_parquet
                     split = vars(self.config)["test_split"]
                     task = vars(self.config)["task"]
 
@@ -948,7 +1087,11 @@ class ConfigurableTask(Task):
                 if accelerator.is_main_process:
                     force_download = dataset_kwargs.get("force_download", False)
                     force_unzip = dataset_kwargs.get("force_unzip", False)
-                    cache_path = snapshot_download(repo_id=self.DATASET_PATH, repo_type="dataset", force_download=force_download, etag_timeout=60)
+                    cache_path = _ensure_snapshot(
+                        cache_path,
+                        force_download=force_download,
+                        etag_timeout=60,
+                    )
                     zip_files = glob(os.path.join(cache_path, "**/*.zip"), recursive=True)
                     tar_files = glob(os.path.join(cache_path, "**/*.tar*"), recursive=True)
 
@@ -1017,6 +1160,9 @@ class ConfigurableTask(Task):
 
             if "builder_script" in dataset_kwargs:
                 builder_script = dataset_kwargs["builder_script"]
+                cache_path = _ensure_snapshot(cache_path)
+                if cache_path is None:
+                    raise ValueError("builder_script requires a downloadable dataset snapshot")
                 self.DATASET_PATH = os.path.join(cache_path, builder_script)
                 dataset_kwargs.pop("builder_script")
 
@@ -1064,6 +1210,30 @@ class ConfigurableTask(Task):
                     "Please ensure task configuration uses '**/' as a full path component."
                 ) from exc
             raise
+        except datasets.exceptions.DataFilesNotFoundError as exc:
+            repo_id = repo_id_for_snapshot if isinstance(repo_id_for_snapshot, str) else None
+            if repo_id is None:
+                raise
+
+            cache_path = _ensure_snapshot(cache_path)
+            if cache_path is None:
+                raise exc
+
+            try:
+                self.dataset = _load_dataset_from_snapshot_parquet(
+                    repo_id=repo_id,
+                    snapshot_path=cache_path,
+                    load_kwargs=load_kwargs,
+                    download_config=download_config,
+                    download_mode=datasets.DownloadMode.REUSE_DATASET_IF_EXISTS,
+                    split_preference=(
+                        self.config.test_split,
+                        self.config.validation_split,
+                        self.config.training_split,
+                    ),
+                )
+            except Exception as fallback_error:
+                raise exc from fallback_error
         if self.config.process_docs is not None:
             for split in self.dataset:
                 if split in [self.config.training_split, self.config.validation_split, self.config.test_split, self.config.fewshot_split]:

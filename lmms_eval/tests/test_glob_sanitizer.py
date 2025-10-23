@@ -212,7 +212,7 @@ def test_patch_hf_glob_sanitizes_paths(monkeypatch):
             return ["ok-list"]
 
         _check(path)
-        return ["ok-str"]
+        return [f"ok:{path}"]
 
     monkeypatch.setattr(HfFileSystem, "glob", _original_glob, raising=False)
     for attr in ("_lmms_eval_glob_patched", "_lmms_eval_original_glob"):
@@ -223,9 +223,55 @@ def test_patch_hf_glob_sanitizes_paths(monkeypatch):
     task_module._patch_hf_hub_glob()
 
     fs = HfFileSystem()
-    assert fs.glob("videos/**.mp4") == ["ok-str"]
+    assert fs.glob("videos/**.mp4") == [
+        "ok:videos/**/*.mp4",
+        "ok:videos/*.mp4",
+    ]
     assert fs.glob(["videos/**.mp4", "images/**.jpg"]) == ["ok-list"]
     assert calls == [
+        "videos/**.mp4",
         "videos/**/*.mp4",
+        "videos/*.mp4",
+        ["videos/**.mp4", "images/**.jpg"],
         ["videos/**/*.mp4", "images/**/*.jpg"],
     ]
+
+
+def test_load_dataset_from_snapshot_parquet(monkeypatch, tmp_path):
+    from lmms_eval.api import task as task_module
+
+    snapshot_dir = tmp_path / "snapshot"
+    snapshot_dir.mkdir()
+    parquet_path = snapshot_dir / "test-00000-of-00001.parquet"
+    parquet_path.write_text("")
+
+    captured = {}
+
+    def fake_load_dataset(path, *args, **kwargs):
+        captured["path"] = path
+        captured["kwargs"] = kwargs
+        return "dataset"
+
+    monkeypatch.setattr(task_module.datasets, "load_dataset", fake_load_dataset)
+
+    download_config = task_module.DownloadConfig()
+
+    result = task_module._load_dataset_from_snapshot_parquet(
+        repo_id="nyu-visionx/VSI-Bench",
+        snapshot_path=str(snapshot_dir),
+        load_kwargs={"token": True, "split": "test"},
+        download_config=download_config,
+        download_mode=task_module.datasets.DownloadMode.REUSE_DATASET_IF_EXISTS,
+        split_preference=("test", "train"),
+    )
+
+    assert result == "dataset"
+    assert captured["path"] == "parquet"
+    assert captured["kwargs"]["data_files"] == {"test": [str(parquet_path)]}
+    assert "token" not in captured["kwargs"]
+    assert captured["kwargs"]["split"] == "test"
+    assert captured["kwargs"]["download_config"] is download_config
+    assert (
+        captured["kwargs"]["download_mode"]
+        == task_module.datasets.DownloadMode.REUSE_DATASET_IF_EXISTS
+    )

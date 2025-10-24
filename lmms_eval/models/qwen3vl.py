@@ -183,7 +183,10 @@ class Qwen3VL(lmms):
                 messages, tokenize=False, add_generation_prompt=True
             )
             _, video_inputs = self._process_vision_info(messages)
-            video_inputs = self._ensure_video_metadata(video_inputs)
+            video_inputs = self._coerce_vllm_video_payload(
+                video_inputs,
+                default_nframes=self.max_frames_num or 32,
+            )
             generated = self._model.generate(
                 {
                     "prompt": text,
@@ -198,56 +201,79 @@ class Qwen3VL(lmms):
         return res
 
     @staticmethod
-    def _ensure_video_metadata(video_inputs: Any) -> Any:
-        """Fill in missing metadata dictionaries expected by vLLM's Qwen3 backend.
+    def _coerce_vllm_video_payload(video_inputs: Any, default_nframes: int = 32) -> List[Dict[str, Any]]:
+        """Return ``multi_modal_data['video']`` in the exact structure vLLM expects.
 
-        Qwen3's multimodal processor assumes every video payload includes a
-        ``metadata`` mapping. Older revisions of ``qwen-vl-utils`` may return
-        ``None`` for this field, which leads to ``AttributeError`` inside
-        vLLM's sampling utilities.  To remain compatible with those versions we
-        recursively replace ``None`` metadata entries with empty dictionaries
-        and leave any existing metadata untouched.  The helper also understands
-        generic mapping/sequence containers returned by ``transformers`` so we
-        handle ``BatchFeature`` objects in addition to vanilla ``dict``/``list``.
+        vLLM's Qwen3-VL processor assumes each video payload is a mapping with a
+        ``metadata`` dictionary. Some revisions of ``qwen-vl-utils`` hand back
+        ``None`` or non-mapping containers. This helper converts any recognised
+        input into a list of dictionaries and guarantees the metadata contract.
         """
+
+        default_nframes = default_nframes or 32
+
         def _coerce_metadata(value: Any) -> Dict[str, Any]:
-            if value is None:
-                metadata_dict: Dict[str, Any] = {}
-            elif isinstance(value, Mapping):
-                metadata_dict = dict(value)
+            if isinstance(value, Mapping):
+                metadata = dict(value)
             else:
                 try:
-                    metadata_dict = dict(value)
-                except TypeError:
-                    metadata_dict = {}
-            metadata_dict.setdefault("do_sample_frames", True)
-            return metadata_dict
+                    metadata = dict(value)  # type: ignore[arg-type]
+                except Exception:
+                    metadata = {}
+            metadata.setdefault("do_sample_frames", True)
+            return metadata
 
-        def _normalize_mapping(mapping: Mapping[str, Any]) -> Dict[str, Any]:
-            normalized: Dict[str, Any] = {k: Qwen3VL._ensure_video_metadata(v) for k, v in mapping.items() if k != "metadata"}
-            if "metadata" in mapping:
-                normalized["metadata"] = _coerce_metadata(mapping["metadata"])
-            elif any(key in mapping for key in ("video", "videos", "image", "images")):
-                normalized["metadata"] = _coerce_metadata(None)
-            return normalized
+        def _wrap_item(item: Any) -> Dict[str, Any]:
+            if isinstance(item, (str, bytes, bytearray)):
+                return {
+                    "video": item,
+                    "metadata": {"do_sample_frames": True},
+                    "nframes": default_nframes,
+                }
+
+            if isinstance(item, Mapping):
+                entry = dict(item)
+                if "video" not in entry and "path" in entry:
+                    entry["video"] = entry.pop("path")
+                entry["metadata"] = _coerce_metadata(entry.get("metadata", {}))
+                entry.setdefault("nframes", default_nframes)
+                return entry
+
+            if isinstance(item, Sequence) and not isinstance(item, (str, bytes, bytearray)):
+                seq_values = list(item)
+                video_value = seq_values[0] if seq_values else None
+                metadata_value = seq_values[1] if len(seq_values) > 1 else {}
+                return {
+                    "video": video_value,
+                    "metadata": _coerce_metadata(metadata_value),
+                    "nframes": default_nframes,
+                }
+
+            return {
+                "video": item,
+                "metadata": {"do_sample_frames": True},
+                "nframes": default_nframes,
+            }
 
         if video_inputs is None:
-            return {"metadata": _coerce_metadata(None)}
+            return [
+                {
+                    "video": None,
+                    "metadata": {"do_sample_frames": True},
+                    "nframes": default_nframes,
+                }
+            ]
 
-        if isinstance(video_inputs, Mapping):
-            return _normalize_mapping(video_inputs)
+        if isinstance(video_inputs, (list, tuple)):
+            return [_wrap_item(elem) for elem in video_inputs]
 
         if isinstance(video_inputs, Sequence) and not isinstance(video_inputs, (str, bytes, bytearray)):
-            normalized_seq = [Qwen3VL._ensure_video_metadata(item) for item in video_inputs]
-            seq_type = type(video_inputs)
-            if seq_type in (list, tuple):
-                return seq_type(normalized_seq)
-            try:
-                return seq_type(normalized_seq)
-            except TypeError:
-                return normalized_seq
+            return [_wrap_item(elem) for elem in video_inputs]
 
-        return video_inputs
+        if isinstance(video_inputs, Mapping):
+            return [_wrap_item(video_inputs)]
+
+        return [_wrap_item(video_inputs)]
 
     def loglikelihood(self, requests: List[Instance]) -> List[Tuple[float, bool]]:
         raise NotImplementedError("Log-likelihood computation is not implemented for Qwen3VL.")

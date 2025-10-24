@@ -168,7 +168,7 @@ for model in "${models[@]}"; do
     fi
 
     printf 'Running command: '
-    printf '%q ' "${cmd[@]}"
+    printf '%s ' "${cmd[@]}"
     printf '\n'
 
     "${cmd[@]}"

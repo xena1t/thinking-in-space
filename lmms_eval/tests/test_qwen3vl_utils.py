@@ -55,3 +55,12 @@ def test_ensure_video_metadata_converts_none_payload():
     Qwen3VL = _load_qwen3vl_module().Qwen3VL
     fixed = Qwen3VL._ensure_video_metadata(None)
     assert fixed["metadata"]["do_sample_frames"] is True
+
+
+def test_ensure_video_metadata_injects_when_missing_metadata_key():
+    Qwen3VL = _load_qwen3vl_module().Qwen3VL
+    payload = {"videos": ({"video": "foo.mp4"},)}
+    fixed = Qwen3VL._ensure_video_metadata(payload)
+    assert fixed["metadata"]["do_sample_frames"] is True
+    assert fixed["videos"][0]["metadata"]["do_sample_frames"] is True
+    assert isinstance(fixed["videos"], tuple)

@@ -1,7 +1,8 @@
 import multiprocessing as mp
 import os
 import sys
-from typing import Dict, List, Optional, Tuple
+from collections.abc import Mapping, Sequence
+from typing import Any, Dict, List, Optional, Tuple
 
 from tqdm import tqdm
 from transformers import AutoProcessor, AutoTokenizer
@@ -197,7 +198,7 @@ class Qwen3VL(lmms):
         return res
 
     @staticmethod
-    def _ensure_video_metadata(video_inputs):
+    def _ensure_video_metadata(video_inputs: Any) -> Any:
         """Fill in missing metadata dictionaries expected by vLLM's Qwen3 backend.
 
         Qwen3's multimodal processor assumes every video payload includes a
@@ -209,12 +210,9 @@ class Qwen3VL(lmms):
         generic mapping/sequence containers returned by ``transformers`` so we
         handle ``BatchFeature`` objects in addition to vanilla ``dict``/``list``.
         """
-
-        from collections.abc import Mapping, Sequence
-
-        def _coerce_metadata(value):
+        def _coerce_metadata(value: Any) -> Dict[str, Any]:
             if value is None:
-                metadata_dict = {}
+                metadata_dict: Dict[str, Any] = {}
             elif isinstance(value, Mapping):
                 metadata_dict = dict(value)
             else:
@@ -225,33 +223,27 @@ class Qwen3VL(lmms):
             metadata_dict.setdefault("do_sample_frames", True)
             return metadata_dict
 
-        if video_inputs is None:
-            return {"metadata": {"do_sample_frames": True}}
-
-        if isinstance(video_inputs, Mapping):
-            sentinel_keys = {"video", "videos", "image", "images"}
-            normalized = {}
-            has_media_key = False
-            for key, value in video_inputs.items():
-                if key == "metadata":
-                    normalized["metadata"] = _coerce_metadata(value)
-                    continue
-                if key in sentinel_keys:
-                    has_media_key = True
-                normalized[key] = Qwen3VL._ensure_video_metadata(value)
-            if has_media_key and "metadata" not in normalized:
+        def _normalize_mapping(mapping: Mapping[str, Any]) -> Dict[str, Any]:
+            normalized: Dict[str, Any] = {k: Qwen3VL._ensure_video_metadata(v) for k, v in mapping.items() if k != "metadata"}
+            if "metadata" in mapping:
+                normalized["metadata"] = _coerce_metadata(mapping["metadata"])
+            elif any(key in mapping for key in ("video", "videos", "image", "images")):
                 normalized["metadata"] = _coerce_metadata(None)
             return normalized
 
+        if video_inputs is None:
+            return {"metadata": _coerce_metadata(None)}
+
+        if isinstance(video_inputs, Mapping):
+            return _normalize_mapping(video_inputs)
+
         if isinstance(video_inputs, Sequence) and not isinstance(video_inputs, (str, bytes, bytearray)):
-            container_type = type(video_inputs)
             normalized_seq = [Qwen3VL._ensure_video_metadata(item) for item in video_inputs]
-            if container_type is tuple:
-                return tuple(normalized_seq)
-            if container_type is list:
-                return normalized_seq
+            seq_type = type(video_inputs)
+            if seq_type in (list, tuple):
+                return seq_type(normalized_seq)
             try:
-                return container_type(normalized_seq)
+                return seq_type(normalized_seq)
             except TypeError:
                 return normalized_seq
 

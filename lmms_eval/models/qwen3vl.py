@@ -14,9 +14,6 @@ except ImportError:  # pragma: no cover - handled during model init
     LLM = None
     SamplingParams = None
 
-from vllm import LLM, SamplingParams
-from transformers import AutoProcessor, AutoTokenizer
-
 from lmms_eval.api.instance import Instance
 from lmms_eval.api.model import lmms
 from lmms_eval.api.registry import register_model
@@ -185,6 +182,7 @@ class Qwen3VL(lmms):
                 messages, tokenize=False, add_generation_prompt=True
             )
             _, video_inputs = self._process_vision_info(messages)
+            video_inputs = self._ensure_video_metadata(video_inputs)
             generated = self._model.generate(
                 {
                     "prompt": text,
@@ -197,6 +195,67 @@ class Qwen3VL(lmms):
             pbar.update(1)
         pbar.close()
         return res
+
+    @staticmethod
+    def _ensure_video_metadata(video_inputs):
+        """Fill in missing metadata dictionaries expected by vLLM's Qwen3 backend.
+
+        Qwen3's multimodal processor assumes every video payload includes a
+        ``metadata`` mapping. Older revisions of ``qwen-vl-utils`` may return
+        ``None`` for this field, which leads to ``AttributeError`` inside
+        vLLM's sampling utilities.  To remain compatible with those versions we
+        recursively replace ``None`` metadata entries with empty dictionaries
+        and leave any existing metadata untouched.  The helper also understands
+        generic mapping/sequence containers returned by ``transformers`` so we
+        handle ``BatchFeature`` objects in addition to vanilla ``dict``/``list``.
+        """
+
+        from collections.abc import Mapping, Sequence
+
+        def _coerce_metadata(value):
+            if value is None:
+                metadata_dict = {}
+            elif isinstance(value, Mapping):
+                metadata_dict = dict(value)
+            else:
+                try:
+                    metadata_dict = dict(value)
+                except TypeError:
+                    metadata_dict = {}
+            metadata_dict.setdefault("do_sample_frames", True)
+            return metadata_dict
+
+        if video_inputs is None:
+            return {"metadata": {"do_sample_frames": True}}
+
+        if isinstance(video_inputs, Mapping):
+            sentinel_keys = {"video", "videos", "image", "images"}
+            normalized = {}
+            has_media_key = False
+            for key, value in video_inputs.items():
+                if key == "metadata":
+                    normalized["metadata"] = _coerce_metadata(value)
+                    continue
+                if key in sentinel_keys:
+                    has_media_key = True
+                normalized[key] = Qwen3VL._ensure_video_metadata(value)
+            if has_media_key and "metadata" not in normalized:
+                normalized["metadata"] = _coerce_metadata(None)
+            return normalized
+
+        if isinstance(video_inputs, Sequence) and not isinstance(video_inputs, (str, bytes, bytearray)):
+            container_type = type(video_inputs)
+            normalized_seq = [Qwen3VL._ensure_video_metadata(item) for item in video_inputs]
+            if container_type is tuple:
+                return tuple(normalized_seq)
+            if container_type is list:
+                return normalized_seq
+            try:
+                return container_type(normalized_seq)
+            except TypeError:
+                return normalized_seq
+
+        return video_inputs
 
     def loglikelihood(self, requests: List[Instance]) -> List[Tuple[float, bool]]:
         raise NotImplementedError("Log-likelihood computation is not implemented for Qwen3VL.")

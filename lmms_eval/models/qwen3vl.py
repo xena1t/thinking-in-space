@@ -202,13 +202,7 @@ class Qwen3VL(lmms):
 
     @staticmethod
     def _coerce_vllm_video_payload(video_inputs: Any, default_nframes: int = 32) -> List[Dict[str, Any]]:
-        """Return ``multi_modal_data['video']`` in the exact structure vLLM expects.
-
-        vLLM's Qwen3-VL processor assumes each video payload is a mapping with a
-        ``metadata`` dictionary. Some revisions of ``qwen-vl-utils`` hand back
-        ``None`` or non-mapping containers. This helper converts any recognised
-        input into a list of dictionaries and guarantees the metadata contract.
-        """
+        """Return ``multi_modal_data['video']`` in the exact structure vLLM expects."""
 
         default_nframes = default_nframes or 32
 
@@ -223,34 +217,65 @@ class Qwen3VL(lmms):
             metadata.setdefault("do_sample_frames", True)
             return metadata
 
+        def _coerce_video_value(value: Any) -> Any:
+            """Convert tensors/arrays into numpy uint8 arrays accepted by vLLM."""
+            try:  # torch tensors -> numpy
+                import torch  # type: ignore
+            except ImportError:  # pragma: no cover - torch optional
+                torch = None  # type: ignore
+
+            if torch is not None and isinstance(value, torch.Tensor):  # type: ignore[attr-defined]
+                tensor = value.detach().cpu()
+                if tensor.ndim == 4 and tensor.shape[1] in (1, 3, 4):
+                    tensor = tensor.permute(0, 2, 3, 1).contiguous()
+                elif tensor.ndim == 3 and tensor.shape[0] in (1, 3, 4):
+                    tensor = tensor.permute(1, 2, 0).contiguous()
+                if tensor.dtype != torch.uint8:  # type: ignore[attr-defined]
+                    tensor = tensor.clamp(0, 255).to(torch.uint8)
+                value = tensor.numpy()
+
+            try:  # normalise numpy arrays as well
+                import numpy as np  # type: ignore
+            except ImportError:  # pragma: no cover - numpy optional
+                np = None  # type: ignore
+
+            if np is not None and isinstance(value, np.ndarray):  # type: ignore[attr-defined]
+                array = value
+                if array.ndim == 4 and array.shape[1] in (1, 3, 4):
+                    array = array.transpose(0, 2, 3, 1)
+                elif array.ndim == 3 and array.shape[0] in (1, 3, 4):
+                    array = array.transpose(1, 2, 0)
+                if array.dtype != np.uint8:  # type: ignore[attr-defined]
+                    array = np.clip(array, 0, 255).astype(np.uint8)
+                value = array
+
+            return value
+
         def _wrap_item(item: Any) -> Dict[str, Any]:
             if isinstance(item, (str, bytes, bytearray)):
-                return {
-                    "video": item,
-                    "metadata": {"do_sample_frames": True},
-                    "nframes": default_nframes,
-                }
-
-            if isinstance(item, Mapping):
+                video_value = item
+            elif isinstance(item, Mapping):
                 entry = dict(item)
                 if "video" not in entry and "path" in entry:
                     entry["video"] = entry.pop("path")
+                entry["video"] = _coerce_video_value(entry.get("video"))
                 entry["metadata"] = _coerce_metadata(entry.get("metadata", {}))
                 entry.setdefault("nframes", default_nframes)
                 return entry
-
-            if isinstance(item, Sequence) and not isinstance(item, (str, bytes, bytearray)):
+            elif isinstance(item, Sequence) and not isinstance(item, (str, bytes, bytearray)):
                 seq_values = list(item)
-                video_value = seq_values[0] if seq_values else None
-                metadata_value = seq_values[1] if len(seq_values) > 1 else {}
+                video_value = _coerce_video_value(seq_values[0] if seq_values else None)
+                metadata_value = _coerce_metadata(seq_values[1] if len(seq_values) > 1 else {})
                 return {
                     "video": video_value,
-                    "metadata": _coerce_metadata(metadata_value),
+                    "metadata": metadata_value,
                     "nframes": default_nframes,
                 }
+            else:
+                video_value = item
 
             return {
-                "video": item,
+                "video": _coerce_video_value(video_value),
                 "metadata": {"do_sample_frames": True},
                 "nframes": default_nframes,
             }

@@ -1,7 +1,8 @@
 import multiprocessing as mp
 import os
 import sys
-from typing import Dict, List, Optional, Tuple
+from collections.abc import Mapping, Sequence
+from typing import Any, Dict, List, Optional, Tuple
 
 from tqdm import tqdm
 from transformers import AutoProcessor, AutoTokenizer
@@ -13,9 +14,6 @@ try:  # pragma: no cover - optional dependency that is validated at runtime
 except ImportError:  # pragma: no cover - handled during model init
     LLM = None
     SamplingParams = None
-
-from vllm import LLM, SamplingParams
-from transformers import AutoProcessor, AutoTokenizer
 
 from lmms_eval.api.instance import Instance
 from lmms_eval.api.model import lmms
@@ -185,6 +183,10 @@ class Qwen3VL(lmms):
                 messages, tokenize=False, add_generation_prompt=True
             )
             _, video_inputs = self._process_vision_info(messages)
+            video_inputs = self._coerce_vllm_video_payload(
+                video_inputs,
+                default_nframes=self.max_frames_num or 32,
+            )
             generated = self._model.generate(
                 {
                     "prompt": text,
@@ -197,6 +199,106 @@ class Qwen3VL(lmms):
             pbar.update(1)
         pbar.close()
         return res
+
+    @staticmethod
+    def _coerce_vllm_video_payload(video_inputs: Any, default_nframes: int = 32) -> List[Dict[str, Any]]:
+        """Return ``multi_modal_data['video']`` in the exact structure vLLM expects."""
+
+        default_nframes = default_nframes or 32
+
+        def _coerce_metadata(value: Any) -> Dict[str, Any]:
+            if isinstance(value, Mapping):
+                metadata = dict(value)
+            else:
+                try:
+                    metadata = dict(value)  # type: ignore[arg-type]
+                except Exception:
+                    metadata = {}
+            metadata.setdefault("do_sample_frames", True)
+            return metadata
+
+        def _coerce_video_value(value: Any) -> Any:
+            """Convert tensors/arrays into numpy uint8 arrays accepted by vLLM."""
+            try:  # torch tensors -> numpy
+                import torch  # type: ignore
+            except ImportError:  # pragma: no cover - torch optional
+                torch = None  # type: ignore
+
+            if torch is not None and isinstance(value, torch.Tensor):  # type: ignore[attr-defined]
+                tensor = value.detach().cpu()
+                if tensor.ndim == 4 and tensor.shape[1] in (1, 3, 4):
+                    tensor = tensor.permute(0, 2, 3, 1).contiguous()
+                elif tensor.ndim == 3 and tensor.shape[0] in (1, 3, 4):
+                    tensor = tensor.permute(1, 2, 0).contiguous()
+                if tensor.dtype != torch.uint8:  # type: ignore[attr-defined]
+                    tensor = tensor.clamp(0, 255).to(torch.uint8)
+                value = tensor.numpy()
+
+            try:  # normalise numpy arrays as well
+                import numpy as np  # type: ignore
+            except ImportError:  # pragma: no cover - numpy optional
+                np = None  # type: ignore
+
+            if np is not None and isinstance(value, np.ndarray):  # type: ignore[attr-defined]
+                array = value
+                if array.ndim == 4 and array.shape[1] in (1, 3, 4):
+                    array = array.transpose(0, 2, 3, 1)
+                elif array.ndim == 3 and array.shape[0] in (1, 3, 4):
+                    array = array.transpose(1, 2, 0)
+                if array.dtype != np.uint8:  # type: ignore[attr-defined]
+                    array = np.clip(array, 0, 255).astype(np.uint8)
+                value = array
+
+            return value
+
+        def _wrap_item(item: Any) -> Dict[str, Any]:
+            if isinstance(item, (str, bytes, bytearray)):
+                video_value = item
+            elif isinstance(item, Mapping):
+                entry = dict(item)
+                if "video" not in entry and "path" in entry:
+                    entry["video"] = entry.pop("path")
+                entry["video"] = _coerce_video_value(entry.get("video"))
+                entry["metadata"] = _coerce_metadata(entry.get("metadata", {}))
+                entry.setdefault("nframes", default_nframes)
+                return entry
+            elif isinstance(item, Sequence) and not isinstance(item, (str, bytes, bytearray)):
+                seq_values = list(item)
+                video_value = _coerce_video_value(seq_values[0] if seq_values else None)
+                metadata_value = _coerce_metadata(seq_values[1] if len(seq_values) > 1 else {})
+                return {
+                    "video": video_value,
+                    "metadata": metadata_value,
+                    "nframes": default_nframes,
+                }
+            else:
+                video_value = item
+
+            return {
+                "video": _coerce_video_value(video_value),
+                "metadata": {"do_sample_frames": True},
+                "nframes": default_nframes,
+            }
+
+        if video_inputs is None:
+            return [
+                {
+                    "video": None,
+                    "metadata": {"do_sample_frames": True},
+                    "nframes": default_nframes,
+                }
+            ]
+
+        if isinstance(video_inputs, (list, tuple)):
+            return [_wrap_item(elem) for elem in video_inputs]
+
+        if isinstance(video_inputs, Sequence) and not isinstance(video_inputs, (str, bytes, bytearray)):
+            return [_wrap_item(elem) for elem in video_inputs]
+
+        if isinstance(video_inputs, Mapping):
+            return [_wrap_item(video_inputs)]
+
+        return [_wrap_item(video_inputs)]
 
     def loglikelihood(self, requests: List[Instance]) -> List[Tuple[float, bool]]:
         raise NotImplementedError("Log-likelihood computation is not implemented for Qwen3VL.")

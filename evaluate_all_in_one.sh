@@ -144,30 +144,32 @@ for model in "${models[@]}"; do
 
     if [ "$launcher" = "python" ]; then
         export LMMS_EVAL_LAUNCHER="python"
-        evaluate_script="python \
-            "
+        cmd=(python -m lmms_eval)
     elif [ "$launcher" = "accelerate" ]; then
         export LMMS_EVAL_LAUNCHER="accelerate"
-        evaluate_script="accelerate launch \
-            --num_processes=$num_processes \
-            "
+        cmd=(accelerate launch --num_processes "$num_processes" -m lmms_eval)
+    else
+        echo "Unknown launcher: $launcher"
+        exit 1
     fi
 
-    evaluate_script="$evaluate_script -m lmms_eval \
-        --model $model_family \
-        --model_args "$model_args" \
-        --tasks $benchmark \
-        --batch_size 1 \
-        --log_samples \
-        --log_samples_suffix $model \
-        --output_path $output_path/$benchmark \
-        "
+    cmd+=(
+        --model "$model_family"
+        --model_args "$model_args"
+        --tasks "$benchmark"
+        --batch_size 1
+        --log_samples
+        --log_samples_suffix "$model"
+        --output_path "$output_path/$benchmark"
+    )
 
     if [ -n "$limit" ]; then
-        evaluate_script="$evaluate_script \
-            --limit $limit \
-        "
+        cmd+=(--limit "$limit")
     fi
-    echo $evaluate_script
-    eval $evaluate_script
+
+    printf 'Running command: '
+    printf '%s ' "${cmd[@]}"
+    printf '\n'
+
+    "${cmd[@]}"
 done

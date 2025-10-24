@@ -225,25 +225,27 @@ class Qwen3VL(lmms):
             metadata_dict.setdefault("do_sample_frames", True)
             return metadata_dict
 
-        def _needs_metadata(mapping: Mapping) -> bool:
-            if "metadata" in mapping:
-                return True
-            sentinel_keys = {"video", "videos", "image", "images"}
-            return any(key in mapping for key in sentinel_keys)
-
         if video_inputs is None:
             return {"metadata": {"do_sample_frames": True}}
 
         if isinstance(video_inputs, Mapping):
-            normalized = {k: Qwen3VL._ensure_video_metadata(v) for k, v in video_inputs.items()}
-            if _needs_metadata(normalized):
-                normalized["metadata"] = _coerce_metadata(normalized.get("metadata"))
+            sentinel_keys = {"video", "videos", "image", "images"}
+            normalized = {}
+            has_media_key = False
+            for key, value in video_inputs.items():
+                if key == "metadata":
+                    normalized["metadata"] = _coerce_metadata(value)
+                    continue
+                if key in sentinel_keys:
+                    has_media_key = True
+                normalized[key] = Qwen3VL._ensure_video_metadata(value)
+            if has_media_key and "metadata" not in normalized:
+                normalized["metadata"] = _coerce_metadata(None)
             return normalized
 
         if isinstance(video_inputs, Sequence) and not isinstance(video_inputs, (str, bytes, bytearray)):
             container_type = type(video_inputs)
             normalized_seq = [Qwen3VL._ensure_video_metadata(item) for item in video_inputs]
-            # Preserve tuples to avoid surprising downstream code that expects immutability.
             if container_type is tuple:
                 return tuple(normalized_seq)
             if container_type is list:

@@ -22,6 +22,7 @@ def _patch_vllm_qwen3_metadata_guard() -> None:
     try:  # pragma: no cover - optional dependency
         import importlib
         import inspect
+        import re
 
         module = importlib.import_module("vllm.model_executor.models.qwen3_vl")
     except Exception:  # pragma: no cover - if vLLM is unavailable or layout changes
@@ -36,11 +37,61 @@ def _patch_vllm_qwen3_metadata_guard() -> None:
     except (OSError, IOError):  # pragma: no cover - source unavailable (pyc only)
         return
 
-    if "(metadata or {})" in source:
+    if "(metadata or {})" in source and "meta_for_ctor" in source:
         return  # already patched upstream
 
+    # Ensure metadata lookups are safe when ``metadata`` is ``None``.
     patched_source = source.replace("metadata.get(", "(metadata or {}).get(")
-    if patched_source == source:
+
+    # Strengthen the VideoMetadata construction with inferred defaults.
+    pattern = re.compile(
+        r"(?P<indent>\s*)metadata\s*=\s*VideoMetadata\(\*\*\{.*?\}\)",
+        re.DOTALL,
+    )
+
+    replacement_block = """
+metadata_dict = metadata.to_dict() if metadata else {}
+_meta_dict = dict(metadata_dict)
+_meta_src = dict(metadata_dict)
+video_array = video_feat
+try:
+    _t = int(_meta_dict.get("total_num_frames", video_array.shape[0]))
+except Exception:
+    try:
+        _t = int(len(video_array))
+    except Exception:
+        _t = _meta_src.get("total_num_frames", 0)
+try:
+    _h = int(getattr(video_array, "shape", [None, None, None])[1])
+    _w = int(getattr(video_array, "shape", [None, None, None])[2])
+except Exception:
+    try:
+        _t = int(len(video_array))
+    except Exception:
+        _t = _meta_src.get("total_num_frames", 0)
+    _h = _meta_src.get("height")
+    _w = _meta_src.get("width")
+
+meta_for_ctor = {
+    "total_num_frames": _meta_dict.get("total_num_frames", _t),
+    "height": _meta_dict.get("height", _h),
+    "width": _meta_dict.get("width", _w),
+    "fps": _meta_dict.get("fps", _meta_dict.get("frame_rate", 30)),
+}
+for _k, _v in _meta_dict.items():
+    if _k not in meta_for_ctor:
+        meta_for_ctor[_k] = _v
+
+metadata = VideoMetadata(**meta_for_ctor)
+""".strip("\n")
+
+    def _replace_metadata_block(match: "re.Match[str]") -> str:
+        indent = match.group("indent")
+        return "\n".join(f"{indent}{line}" for line in replacement_block.splitlines())
+
+    patched_source, count = pattern.subn(_replace_metadata_block, patched_source)
+
+    if patched_source == source and count == 0:
         return  # nothing to patch
 
     namespace: Dict[str, object] = {}

@@ -4,10 +4,11 @@ import inspect
 import itertools
 import json
 import os
-import random
 import re
+import random
 import shutil
 import subprocess
+from copy import deepcopy
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from glob import glob
@@ -31,7 +32,13 @@ from datasets import DownloadConfig, Image, Sequence
 from huggingface_hub import snapshot_download
 from loguru import logger as eval_logger
 from PIL import ImageFile
-from tenacity import retry, stop_after_attempt, stop_after_delay, wait_fixed
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    stop_after_delay,
+    wait_fixed,
+)
 from tqdm import tqdm
 
 from lmms_eval import utils
@@ -58,6 +65,184 @@ ALL_OUTPUT_TYPES = [
     "multiple_choice",
     "generate_until",
 ]
+
+
+_DOUBLE_STAR_INVALID_RE = re.compile(r"\*\*(?!/|$)")
+
+_HF_GLOB_PATCHED = False
+
+
+def _normalize_double_star_component(value: str) -> str:
+    """Ensure any '**' segment becomes a full path component for fsspec."""
+    if not isinstance(value, str):
+        return value
+
+    normalized = value
+    while True:
+        updated = re.sub(r"(?<!^)(?<!/)\*\*", r"/**", normalized)
+        updated = _DOUBLE_STAR_INVALID_RE.sub("**/*", updated)
+        if updated == normalized:
+            break
+        normalized = updated
+    return normalized
+
+
+def _sanitize_globs(value):
+    """Return a sanitized copy of *value* with legal double-star glob usage."""
+    if isinstance(value, Mapping):
+        return {k: _sanitize_globs(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_globs(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_sanitize_globs(v) for v in value)
+    if isinstance(value, str):
+        return _normalize_double_star_component(value)
+    return value
+
+
+def _patch_hf_hub_glob() -> None:
+    """Monkey-patch Hugging Face's fsspec glob to fix invalid ``**`` patterns."""
+
+    global _HF_GLOB_PATCHED
+
+    if _HF_GLOB_PATCHED:
+        return
+
+    try:
+        from huggingface_hub.hf_file_system import HfFileSystem
+    except ImportError:  # pragma: no cover - optional dependency
+        return
+
+    if getattr(HfFileSystem, "_lmms_eval_glob_patched", False):
+        _HF_GLOB_PATCHED = True
+        return
+
+    original_glob = HfFileSystem.glob
+
+    def _generate_double_star_variants(original_pattern: str) -> list[str]:
+        """Return additional patterns that capture root-level matches for ``**.ext`` forms."""
+
+        variants: list[str] = []
+
+        if "**." in original_pattern:
+            # Replace the illegal "**." fragment with a single-level wildcard so files
+            # that live directly under the prefix continue to match.
+            variants.append(original_pattern.replace("**.", "*."))
+
+        if original_pattern.endswith("/**"):
+            variants.append(original_pattern[:-3] + "/*")
+
+        # Ensure we only return unique, non-empty patterns.
+        deduped: list[str] = []
+        for candidate in variants:
+            if candidate and candidate not in deduped:
+                deduped.append(candidate)
+        return deduped
+
+    def _patched_glob(self, path, *args, **kwargs):
+        try:
+            return original_glob(self, path, *args, **kwargs)
+        except ValueError as exc:
+            if not (
+                isinstance(path, (str, list, tuple))
+                and (
+                    _DOUBLE_STAR_INVALID_RE.search(str(exc))
+                    or (isinstance(path, str) and _DOUBLE_STAR_INVALID_RE.search(path))
+                )
+            ):
+                raise
+
+            sanitized_path = _sanitize_globs(path)
+            try:
+                results = original_glob(self, sanitized_path, *args, **kwargs)
+            except ValueError:
+                # If sanitizing did not produce a valid pattern we surface the original error.
+                raise exc
+
+            if isinstance(path, str) and isinstance(sanitized_path, str):
+                extra_patterns = _generate_double_star_variants(path)
+                if extra_patterns:
+                    aggregated = list(results)
+                    for alt in extra_patterns:
+                        try:
+                            aggregated.extend(original_glob(self, alt, *args, **kwargs))
+                        except ValueError:
+                            continue
+                    if aggregated:
+                        # Avoid duplicate paths while preserving stable ordering.
+                        seen = set()
+                        unique_results = []
+                        for item in aggregated:
+                            if item not in seen:
+                                seen.add(item)
+                                unique_results.append(item)
+                        return unique_results
+
+            return results
+
+    HfFileSystem.glob = _patched_glob  # type: ignore[assignment]
+    setattr(HfFileSystem, "_lmms_eval_glob_patched", True)
+    setattr(HfFileSystem, "_lmms_eval_original_glob", original_glob)
+    _HF_GLOB_PATCHED = True
+
+
+_patch_hf_hub_glob()
+
+
+def _load_dataset_from_snapshot_parquet(
+    *,
+    repo_id: str,
+    snapshot_path: str,
+    load_kwargs: Mapping[str, Any],
+    download_config: DownloadConfig,
+    download_mode: datasets.DownloadMode,
+    split_preference: Iterable[Optional[str]],
+):
+    """Load a parquet dataset directly from a downloaded snapshot.
+
+    When Hugging Face Datasets cannot infer the proper loader for a repo (for
+    example due to strict fsspec glob validation), we fall back to scanning the
+    snapshot for parquet shards and load them explicitly.
+    """
+
+    snapshot_path = os.path.abspath(snapshot_path)
+    parquet_files = sorted(glob(os.path.join(snapshot_path, "**", "*.parquet"), recursive=True))
+    if not parquet_files:
+        raise FileNotFoundError(f"No parquet files found in snapshot for {repo_id}")
+
+    preference: List[str] = [split for split in split_preference if split]
+    default_split = preference[0] if preference else "train"
+
+    def infer_split(path: str) -> str:
+        lower = os.path.basename(path).lower()
+        if "train" in lower:
+            return "train"
+        if "validation" in lower or "val" in lower or "dev" in lower:
+            return "validation"
+        if "test" in lower:
+            return "test"
+        return default_split
+
+    data_files: Dict[str, List[str]] = {}
+    for parquet_path in parquet_files:
+        split_name = infer_split(parquet_path)
+        data_files.setdefault(split_name, []).append(parquet_path)
+
+    sorted_data_files = {split: sorted(paths) for split, paths in data_files.items()}
+
+    parquet_kwargs = {
+        key: value
+        for key, value in load_kwargs.items()
+        if key not in {"token", "data_files"}
+    }
+    parquet_kwargs["data_files"] = sorted_data_files
+
+    return datasets.load_dataset(
+        "parquet",
+        download_config=download_config,
+        download_mode=download_mode,
+        **parquet_kwargs,
+    )
 
 
 @dataclass
@@ -792,7 +977,11 @@ class ConfigurableTask(Task):
                     eval_logger.warning(f"[Task: {self._config.task}] metric {metric_name} is defined, but higher_is_better is not. " f"using default " f"higher_is_better={is_higher_better(metric_name)}")
                     self._higher_is_better[metric_name] = is_higher_better(metric_name)
 
-    @retry(stop=(stop_after_attempt(5) | stop_after_delay(60)), wait=wait_fixed(2))
+    @retry(
+        stop=(stop_after_attempt(5) | stop_after_delay(60)),
+        wait=wait_fixed(2),
+        retry=retry_if_exception_type((OSError, IOError, TimeoutError, ConnectionError)),
+    )
     def download(self, dataset_kwargs=None) -> None:
         # If the dataset is a video dataset,
         # Recursively search whether their is a zip and unzip it to the huggingface home
@@ -801,20 +990,35 @@ class ConfigurableTask(Task):
         download_config.num_proc = dataset_kwargs.get("num_proc", 8) if dataset_kwargs is not None else 8
         download_config.local_files_only = dataset_kwargs.get("local_files_only", False) if dataset_kwargs is not None else False
         if dataset_kwargs is not None:
-            dataset_kwargs = dataset_kwargs.copy()
+            dataset_kwargs = deepcopy(dataset_kwargs)
 
-            def _normalize_glob_patterns(data):
-                if isinstance(data, str):
-                    return re.sub(r"\*\*\.(?=[^/])", "**/*.", data)
-                if isinstance(data, Mapping):
-                    return {k: _normalize_glob_patterns(v) for k, v in data.items()}
-                if isinstance(data, (list, tuple)):
-                    normalized = [_normalize_glob_patterns(v) for v in data]
-                    return type(data)(normalized)
-                return data
+        repo_id_for_snapshot = self.DATASET_PATH if isinstance(self.DATASET_PATH, str) else None
+        cache_path: Optional[str] = None
+        token_value = dataset_kwargs.get("token") if dataset_kwargs is not None else None
 
-            if "data_files" in dataset_kwargs:
-                dataset_kwargs["data_files"] = _normalize_glob_patterns(dataset_kwargs["data_files"])
+        def _ensure_snapshot(existing: Optional[str], **overrides) -> Optional[str]:
+            if existing is not None or repo_id_for_snapshot is None:
+                return existing
+
+            snapshot_kwargs = {
+                "repo_id": repo_id_for_snapshot,
+                "repo_type": "dataset",
+                "local_files_only": download_config.local_files_only,
+            }
+
+            if dataset_kwargs is not None and "revision" in dataset_kwargs:
+                snapshot_kwargs["revision"] = dataset_kwargs["revision"]
+
+            if isinstance(token_value, str):
+                snapshot_kwargs["token"] = token_value
+            elif token_value not in (None, False, True):
+                snapshot_kwargs["token"] = token_value
+
+            snapshot_kwargs.update(overrides)
+
+            return snapshot_download(**snapshot_kwargs)
+
+        if dataset_kwargs is not None:
 
             if "From_YouTube" in dataset_kwargs:
 
@@ -838,13 +1042,13 @@ class ConfigurableTask(Task):
                 if accelerator.is_main_process:
                     dataset_kwargs.pop("From_YouTube")
                     self.all_dataset = datasets.load_dataset(
-                        path=self.DATASET_PATH,
-                        name=self.DATASET_NAME,
+                        path=_sanitize_globs(self.DATASET_PATH),
+                        name=_sanitize_globs(self.DATASET_NAME),
                         download_mode=datasets.DownloadMode.REUSE_DATASET_IF_EXISTS,
                         **dataset_kwargs if dataset_kwargs is not None else {},
                     )
                     dataset_kwargs["From_YouTube"] = True
-                    cache_path = snapshot_download(repo_id=self.DATASET_PATH, repo_type="dataset")  # download_parquet
+                    cache_path = _ensure_snapshot(cache_path)  # download_parquet
                     split = vars(self.config)["test_split"]
                     task = vars(self.config)["task"]
 
@@ -883,7 +1087,11 @@ class ConfigurableTask(Task):
                 if accelerator.is_main_process:
                     force_download = dataset_kwargs.get("force_download", False)
                     force_unzip = dataset_kwargs.get("force_unzip", False)
-                    cache_path = snapshot_download(repo_id=self.DATASET_PATH, repo_type="dataset", force_download=force_download, etag_timeout=60)
+                    cache_path = _ensure_snapshot(
+                        cache_path,
+                        force_download=force_download,
+                        etag_timeout=60,
+                    )
                     zip_files = glob(os.path.join(cache_path, "**/*.zip"), recursive=True)
                     tar_files = glob(os.path.join(cache_path, "**/*.tar*"), recursive=True)
 
@@ -952,6 +1160,9 @@ class ConfigurableTask(Task):
 
             if "builder_script" in dataset_kwargs:
                 builder_script = dataset_kwargs["builder_script"]
+                cache_path = _ensure_snapshot(cache_path)
+                if cache_path is None:
+                    raise ValueError("builder_script requires a downloadable dataset snapshot")
                 self.DATASET_PATH = os.path.join(cache_path, builder_script)
                 dataset_kwargs.pop("builder_script")
 
@@ -964,13 +1175,65 @@ class ConfigurableTask(Task):
             if "local_files_only" in dataset_kwargs:
                 dataset_kwargs.pop("local_files_only")
 
-        self.dataset = datasets.load_dataset(
-            path=self.DATASET_PATH,
-            name=self.DATASET_NAME,
-            download_mode=datasets.DownloadMode.REUSE_DATASET_IF_EXISTS,
-            download_config=download_config,
-            **dataset_kwargs if dataset_kwargs is not None else {},
+        sanitized_path = _sanitize_globs(self.DATASET_PATH) if self.DATASET_PATH is not None else None
+        sanitized_name = _sanitize_globs(self.DATASET_NAME) if self.DATASET_NAME is not None else None
+        if dataset_kwargs is None:
+            load_kwargs = {}
+        else:
+            load_kwargs = _sanitize_globs(dataset_kwargs)
+            if not isinstance(load_kwargs, Mapping):
+                raise TypeError("dataset_kwargs must be a mapping of keyword arguments")
+
+        eval_logger.debug(
+            "[Task: {}] load_dataset with path={!r} name={!r} kwargs={}".format(
+                getattr(self.config, "task", None),
+                sanitized_path,
+                sanitized_name,
+                load_kwargs,
+            )
         )
+
+        _patch_hf_hub_glob()
+
+        try:
+            self.dataset = datasets.load_dataset(
+                path=sanitized_path,
+                name=sanitized_name,
+                download_mode=datasets.DownloadMode.REUSE_DATASET_IF_EXISTS,
+                download_config=download_config,
+                **load_kwargs,
+            )
+        except ValueError as exc:
+            if _DOUBLE_STAR_INVALID_RE.search(str(exc)):
+                raise ValueError(
+                    "datasets.load_dataset rejected a '**' glob pattern after normalization. "
+                    "Please ensure task configuration uses '**/' as a full path component."
+                ) from exc
+            raise
+        except datasets.exceptions.DataFilesNotFoundError as exc:
+            repo_id = repo_id_for_snapshot if isinstance(repo_id_for_snapshot, str) else None
+            if repo_id is None:
+                raise
+
+            cache_path = _ensure_snapshot(cache_path)
+            if cache_path is None:
+                raise exc
+
+            try:
+                self.dataset = _load_dataset_from_snapshot_parquet(
+                    repo_id=repo_id,
+                    snapshot_path=cache_path,
+                    load_kwargs=load_kwargs,
+                    download_config=download_config,
+                    download_mode=datasets.DownloadMode.REUSE_DATASET_IF_EXISTS,
+                    split_preference=(
+                        self.config.test_split,
+                        self.config.validation_split,
+                        self.config.training_split,
+                    ),
+                )
+            except Exception as fallback_error:
+                raise exc from fallback_error
         if self.config.process_docs is not None:
             for split in self.dataset:
                 if split in [self.config.training_split, self.config.validation_split, self.config.test_split, self.config.fewshot_split]:

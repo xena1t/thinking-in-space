@@ -206,6 +206,16 @@ class Qwen3VL(lmms):
 
         default_nframes = default_nframes or 32
 
+        try:  # pragma: no cover - optional import
+            import numpy as np  # type: ignore
+        except ImportError:  # pragma: no cover - numpy optional
+            np = None  # type: ignore
+
+        try:  # pragma: no cover - optional import
+            import torch  # type: ignore
+        except ImportError:  # pragma: no cover - torch optional
+            torch = None  # type: ignore
+
         def _coerce_metadata(value: Any) -> Dict[str, Any]:
             if isinstance(value, Mapping):
                 metadata = dict(value)
@@ -217,13 +227,7 @@ class Qwen3VL(lmms):
             metadata.setdefault("do_sample_frames", True)
             return metadata
 
-        def _coerce_video_value(value: Any) -> Any:
-            """Convert tensors/arrays into numpy uint8 arrays accepted by vLLM."""
-            try:  # torch tensors -> numpy
-                import torch  # type: ignore
-            except ImportError:  # pragma: no cover - torch optional
-                torch = None  # type: ignore
-
+        def _normalise_array(value: Any) -> Any:
             if torch is not None and isinstance(value, torch.Tensor):  # type: ignore[attr-defined]
                 tensor = value.detach().cpu()
                 if tensor.ndim == 4 and tensor.shape[1] in (1, 3, 4):
@@ -234,11 +238,6 @@ class Qwen3VL(lmms):
                     tensor = tensor.clamp(0, 255).to(torch.uint8)
                 value = tensor.numpy()
 
-            try:  # normalise numpy arrays as well
-                import numpy as np  # type: ignore
-            except ImportError:  # pragma: no cover - numpy optional
-                np = None  # type: ignore
-
             if np is not None and isinstance(value, np.ndarray):  # type: ignore[attr-defined]
                 array = value
                 if array.ndim == 4 and array.shape[1] in (1, 3, 4):
@@ -247,35 +246,65 @@ class Qwen3VL(lmms):
                     array = array.transpose(1, 2, 0)
                 if array.dtype != np.uint8:  # type: ignore[attr-defined]
                     array = np.clip(array, 0, 255).astype(np.uint8)
-                value = array
+                return array
 
             return value
 
+        def _as_frames(value: Any) -> List[Any]:
+            normalised = _normalise_array(value)
+            if np is not None and isinstance(normalised, np.ndarray):  # type: ignore[attr-defined]
+                if normalised.ndim == 4:  # THWC
+                    return [normalised[i] for i in range(normalised.shape[0])]
+                if normalised.ndim == 3:  # HWC single frame
+                    return [normalised]
+            return [normalised]
+
         def _wrap_item(item: Any) -> Dict[str, Any]:
             if isinstance(item, (str, bytes, bytearray)):
-                video_value = item
-            elif isinstance(item, Mapping):
-                entry = dict(item)
-                if "video" not in entry and "path" in entry:
-                    entry["video"] = entry.pop("path")
-                entry["video"] = _coerce_video_value(entry.get("video"))
-                entry["metadata"] = _coerce_metadata(entry.get("metadata", {}))
-                entry.setdefault("nframes", default_nframes)
-                return entry
-            elif isinstance(item, Sequence) and not isinstance(item, (str, bytes, bytearray)):
-                seq_values = list(item)
-                video_value = _coerce_video_value(seq_values[0] if seq_values else None)
-                metadata_value = _coerce_metadata(seq_values[1] if len(seq_values) > 1 else {})
                 return {
-                    "video": video_value,
-                    "metadata": metadata_value,
+                    "path": item,
+                    "metadata": {"do_sample_frames": True},
                     "nframes": default_nframes,
                 }
-            else:
-                video_value = item
 
+            if isinstance(item, Mapping):
+                entry = dict(item)
+                source = entry.get("video", entry.get("path", entry.get("frames")))
+                metadata = _coerce_metadata(entry.get("metadata", {}))
+                if isinstance(source, (str, bytes, bytearray)):
+                    result: Dict[str, Any] = {"path": source}
+                else:
+                    result = {"frames": _as_frames(source)}
+                result["metadata"] = metadata
+                result["nframes"] = entry.get("nframes", default_nframes)
+                return result
+
+            if isinstance(item, Sequence) and not isinstance(item, (str, bytes, bytearray)):
+                # Allow tuple like (video, metadata)
+                sequence = list(item)
+                source = sequence[0] if sequence else None
+                metadata = _coerce_metadata(sequence[1] if len(sequence) > 1 else {})
+                if isinstance(source, (str, bytes, bytearray)):
+                    return {
+                        "path": source,
+                        "metadata": metadata,
+                        "nframes": default_nframes,
+                    }
+                return {
+                    "frames": _as_frames(source),
+                    "metadata": metadata,
+                    "nframes": default_nframes,
+                }
+
+            # Fallback: treat as already-decoded frames
+            if isinstance(item, (str, bytes, bytearray)):
+                return {
+                    "path": item,
+                    "metadata": {"do_sample_frames": True},
+                    "nframes": default_nframes,
+                }
             return {
-                "video": _coerce_video_value(video_value),
+                "frames": _as_frames(item),
                 "metadata": {"do_sample_frames": True},
                 "nframes": default_nframes,
             }
@@ -283,20 +312,20 @@ class Qwen3VL(lmms):
         if video_inputs is None:
             return [
                 {
-                    "video": None,
+                    "path": "",
                     "metadata": {"do_sample_frames": True},
                     "nframes": default_nframes,
                 }
             ]
+
+        if isinstance(video_inputs, Mapping):
+            return [_wrap_item(video_inputs)]
 
         if isinstance(video_inputs, (list, tuple)):
             return [_wrap_item(elem) for elem in video_inputs]
 
         if isinstance(video_inputs, Sequence) and not isinstance(video_inputs, (str, bytes, bytearray)):
             return [_wrap_item(elem) for elem in video_inputs]
-
-        if isinstance(video_inputs, Mapping):
-            return [_wrap_item(video_inputs)]
 
         return [_wrap_item(video_inputs)]
 

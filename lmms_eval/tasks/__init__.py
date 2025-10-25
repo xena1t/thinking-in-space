@@ -3,6 +3,7 @@ import collections
 import inspect
 import logging
 import os
+import re
 from functools import partial
 from typing import Dict, List, Mapping, Optional, Union
 
@@ -14,6 +15,63 @@ from lmms_eval.api.task import ConfigurableTask, Task
 from lmms_eval.evaluator_utils import get_subtask_list
 
 GROUP_ONLY_KEYS = list(GroupConfig().to_dict().keys())
+
+_DOUBLE_STAR_INVALID_RE = re.compile(r"\*\*(?!/|$)")
+
+
+def _normalize_glob_string(value: str) -> str:
+    if not isinstance(value, str):
+        return value
+
+    normalized = value
+    while True:
+        updated = re.sub(r"(?<!^)(?<!/)\*\*", r"/**", normalized)
+        updated = _DOUBLE_STAR_INVALID_RE.sub("**/*", updated)
+        if updated == normalized:
+            break
+        normalized = updated
+    return normalized
+
+
+def _glob_sanitize(value):
+    if isinstance(value, dict):
+        return {k: _glob_sanitize(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_glob_sanitize(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_glob_sanitize(v) for v in value)
+    if isinstance(value, str):
+        return _normalize_glob_string(value)
+    return value
+
+
+def _glob_validate(value, path="config"):
+    if isinstance(value, dict):
+        for key, val in value.items():
+            _glob_validate(val, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, val in enumerate(value):
+            _glob_validate(val, f"{path}[{index}]")
+    elif isinstance(value, tuple):
+        for index, val in enumerate(value):
+            _glob_validate(val, f"{path}[{index}]")
+    elif isinstance(value, str):
+        if _DOUBLE_STAR_INVALID_RE.search(value):
+            raise ValueError(
+                f"Invalid glob at {path}: '{value}'. Use '**/' as a full path component, e.g. '**/*.mp4'."
+            )
+
+
+def _load_yaml_config_safe(*, yaml_path=None, yaml_config=None, yaml_dir=None, mode="full"):
+    config = utils.load_yaml_config(
+        yaml_path=yaml_path,
+        yaml_config=yaml_config,
+        yaml_dir=yaml_dir,
+        mode=mode,
+    )
+    sanitized = _glob_sanitize(config)
+    _glob_validate(sanitized)
+    return sanitized
 
 
 class TaskManager:
@@ -131,12 +189,12 @@ class TaskManager:
 
             # read the yaml file to determine the output type
             if path != -1:
-                config = utils.load_yaml_config(path, mode="simple")
+                config = _load_yaml_config_safe(yaml_path=path, mode="simple")
                 if "output_type" in config:
                     output_type = config["output_type"]
                 elif "include" in config:  # if no output type, check if there is an include with an output type
                     include_path = path.split("/")[:-1] + config["include"]
-                    include_config = utils.load_yaml_config(include_path, mode="simple")
+                    include_config = _load_yaml_config_safe(yaml_path=include_path, mode="simple")
                     if "output_type" in include_config:
                         output_type = include_config["output_type"]
 
@@ -211,7 +269,7 @@ class TaskManager:
         if yaml_path == -1:
             return {}
         else:
-            return utils.load_yaml_config(yaml_path, mode="full")
+            return _load_yaml_config_safe(yaml_path=yaml_path, mode="full")
 
     def _get_tasklist(self, name):
         if self._name_is_task(name):
@@ -240,7 +298,7 @@ class TaskManager:
         def _load_task(config, task):
             if "include" in config:
                 config = {
-                    **utils.load_yaml_config(
+                    **_load_yaml_config_safe(
                         yaml_path=None,
                         yaml_config={"include": config.pop("include")},
                         mode="full",
@@ -409,7 +467,7 @@ class TaskManager:
             for f in file_list:
                 if f.endswith(".yaml"):
                     yaml_path = os.path.join(root, f)
-                    config = utils.load_yaml_config(yaml_path, mode="simple")
+                    config = _load_yaml_config_safe(yaml_path=yaml_path, mode="simple")
                     if self._config_is_python_task(config):
                         # This is a python class config
                         tasks_and_groups[config["task"]] = {

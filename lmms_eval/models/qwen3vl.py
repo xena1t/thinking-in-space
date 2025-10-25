@@ -35,7 +35,26 @@ def _patch_vllm_qwen3_metadata_guard() -> None:
     try:
         source = inspect.getsource(target)
     except (OSError, IOError):  # pragma: no cover - source unavailable (pyc only)
-        return
+        module_source = None
+        module_path = getattr(module, "__file__", None)
+        if module_path is not None:
+            try:
+                with open(module_path, "r", encoding="utf-8") as handle:
+                    module_source = handle.read()
+            except OSError:
+                module_source = None
+        if not module_source:
+            return
+
+        # Extract the target function manually from the module source.
+        func_match = re.search(
+            r"^def\\s+_call_hf_processor\\(.*?^\\s*return\\s+mm_processed_data",
+            module_source,
+            re.DOTALL | re.MULTILINE,
+        )
+        if not func_match:
+            return
+        source = func_match.group(0)
 
     if "(metadata or {})" in source and "meta_for_ctor" in source:
         return  # already patched upstream

@@ -15,6 +15,38 @@ except ImportError:  # pragma: no cover - handled during model init
     LLM = None
     SamplingParams = None
 
+
+def _patch_vllm_qwen3_metadata_guard() -> None:
+    """Monkey patch vLLM's Qwen3-VL metadata access to tolerate ``None``."""
+
+    try:  # pragma: no cover - optional dependency
+        import importlib
+        import inspect
+
+        module = importlib.import_module("vllm.model_executor.models.qwen3_vl")
+    except Exception:  # pragma: no cover - if vLLM is unavailable or layout changes
+        return
+
+    target = getattr(module, "_call_hf_processor", None)
+    if not callable(target):  # pragma: no cover - unexpected layout
+        return
+
+    try:
+        source = inspect.getsource(target)
+    except (OSError, IOError):  # pragma: no cover - source unavailable (pyc only)
+        return
+
+    if "(metadata or {})" in source:
+        return  # already patched upstream
+
+    patched_source = source.replace("metadata.get(", "(metadata or {}).get(")
+    if patched_source == source:
+        return  # nothing to patch
+
+    namespace: Dict[str, object] = {}
+    exec(compile(patched_source, target.__code__.co_filename, "exec"), module.__dict__, namespace)
+    module._call_hf_processor = namespace.get(target.__name__, target)
+
 from lmms_eval.api.instance import Instance
 from lmms_eval.api.model import lmms
 from lmms_eval.api.registry import register_model
@@ -86,6 +118,7 @@ class Qwen3VL(lmms):
         vllm_kwargs.setdefault("trust_remote_code", True)
 
         self._ensure_spawn_start_method()
+        _patch_vllm_qwen3_metadata_guard()
         self._model = LLM(self.path, **vllm_kwargs)
         self._processor = AutoProcessor.from_pretrained(self.path, trust_remote_code=True)
         self._tokenizer = AutoTokenizer.from_pretrained(self.path, trust_remote_code=True)

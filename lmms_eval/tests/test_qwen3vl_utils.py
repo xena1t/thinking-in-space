@@ -1,5 +1,4 @@
 import importlib.util
-from collections import UserDict
 from pathlib import Path
 
 import pytest
@@ -8,7 +7,8 @@ import pytest
 _MODULE_PATH = Path(__file__).resolve().parents[1] / "models" / "qwen3vl.py"
 
 
-def _load_qwen3vl_module():
+@pytest.fixture(name="qwen3vl_module")
+def fixture_qwen3vl_module():
     spec = importlib.util.spec_from_file_location("lmms_eval.models.qwen3vl", _MODULE_PATH)
     module = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
@@ -19,48 +19,46 @@ def _load_qwen3vl_module():
     return module
 
 
-def test_ensure_video_metadata_fills_missing_dict():
-    Qwen3VL = _load_qwen3vl_module().Qwen3VL
-    payload = [{"video": "foo.mp4", "metadata": None}]
-    fixed = Qwen3VL._ensure_video_metadata(payload)
-    assert isinstance(fixed, list)
-    assert fixed[0]["metadata"]["do_sample_frames"] is True
+def test_coerce_video_payload_handles_path(qwen3vl_module):
+    Qwen3VL = qwen3vl_module.Qwen3VL
+    result = Qwen3VL._coerce_vllm_video_payload("foo.mp4")
+    assert isinstance(result, list)
+    assert result == ["foo.mp4"]
 
 
-def test_ensure_video_metadata_preserves_existing_fields():
-    Qwen3VL = _load_qwen3vl_module().Qwen3VL
-    payload = {
-        "clip": {"video": "bar.mp4", "metadata": {"fps": 30, "do_sample_frames": False}}
-    }
-    fixed = Qwen3VL._ensure_video_metadata(payload)
-    assert fixed["clip"]["metadata"]["fps"] == 30
-    assert fixed["clip"]["metadata"]["do_sample_frames"] is False
+def test_coerce_video_payload_normalises_numpy_array(qwen3vl_module):
+    np = pytest.importorskip("numpy")
+    Qwen3VL = qwen3vl_module.Qwen3VL
+    array = np.random.randint(0, 255, size=(4, 3, 8, 6), dtype=np.uint8)
+    result = Qwen3VL._coerce_vllm_video_payload(array)
+    assert len(result) == 1
+    coerced = result[0]
+    assert coerced.shape == (4, 8, 6, 3)
+    assert coerced.dtype == np.uint8
 
 
-def test_ensure_video_metadata_handles_mapping_subclasses():
-    Qwen3VL = _load_qwen3vl_module().Qwen3VL
-    payload = UserDict({
-        "videos": [
-            UserDict({"video": "baz.mp4", "metadata": None}),
-            UserDict({"video": "qux.mp4"}),
-        ]
-    })
-    fixed = Qwen3VL._ensure_video_metadata(payload)
-    assert isinstance(fixed["videos"], list)
-    assert all("metadata" in clip for clip in fixed["videos"])
-    assert all(clip["metadata"]["do_sample_frames"] is True for clip in fixed["videos"])
+def test_coerce_video_payload_accepts_mapping(qwen3vl_module):
+    np = pytest.importorskip("numpy")
+    Qwen3VL = qwen3vl_module.Qwen3VL
+    clip = {"video": np.random.rand(2, 3, 4, 5)}
+    result = Qwen3VL._coerce_vllm_video_payload(clip)
+    assert len(result) == 1
+    coerced = result[0]
+    assert coerced.shape == (2, 4, 5, 3)
 
 
-def test_ensure_video_metadata_converts_none_payload():
-    Qwen3VL = _load_qwen3vl_module().Qwen3VL
-    fixed = Qwen3VL._ensure_video_metadata(None)
-    assert fixed["metadata"]["do_sample_frames"] is True
+def test_coerce_video_payload_handles_sequence_of_frames(qwen3vl_module):
+    np = pytest.importorskip("numpy")
+    Qwen3VL = qwen3vl_module.Qwen3VL
+    frames = [np.random.randint(0, 255, size=(4, 4, 3), dtype=np.uint8) for _ in range(3)]
+    result = Qwen3VL._coerce_vllm_video_payload(frames)
+    assert len(result) == 1
+    coerced = result[0]
+    assert coerced.shape == (3, 4, 4, 3)
+    assert coerced.dtype == np.uint8
 
 
-def test_ensure_video_metadata_injects_when_missing_metadata_key():
-    Qwen3VL = _load_qwen3vl_module().Qwen3VL
-    payload = {"videos": ({"video": "foo.mp4"},)}
-    fixed = Qwen3VL._ensure_video_metadata(payload)
-    assert fixed["metadata"]["do_sample_frames"] is True
-    assert fixed["videos"][0]["metadata"]["do_sample_frames"] is True
-    assert isinstance(fixed["videos"], tuple)
+def test_coerce_video_payload_ignores_none_entries(qwen3vl_module):
+    Qwen3VL = qwen3vl_module.Qwen3VL
+    assert Qwen3VL._coerce_vllm_video_payload(None) == []
+

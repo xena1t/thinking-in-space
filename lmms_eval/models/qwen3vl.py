@@ -60,7 +60,8 @@ def _patch_vllm_qwen3_metadata_guard() -> None:
         return  # already patched upstream
 
     # Ensure metadata lookups are safe when ``metadata`` is ``None``.
-    patched_source = source.replace("metadata.get(", "(metadata or {}).get(")
+    metadata_guard_pattern = re.compile(r"metadata\s*\.\s*get\(")
+    patched_source = metadata_guard_pattern.sub("(metadata or {}).get(", source)
 
     # Strengthen the VideoMetadata construction with inferred defaults.
     pattern = re.compile(
@@ -290,11 +291,59 @@ class Qwen3VL(lmms):
                 video_inputs,
                 default_nframes=self.max_frames_num or 32,
             )
+            # --- ENFORCE 1: keep messages/video content count in sync with multi_modal_data ---
+            def _count_video_parts(msgs: List[Dict[str, Any]]) -> int:
+                cnt = 0
+                for m in msgs:
+                    if m.get("role") != "user":
+                        continue
+                    content = m.get("content", [])
+                    if isinstance(content, list):
+                        for c in content:
+                            if isinstance(c, dict) and c.get("type") == "video":
+                                cnt += 1
+                return cnt
+
+            num_mm = len(video_inputs)
+            num_msg_videos = _count_video_parts(messages)
+
+            if num_mm == 0 and num_msg_videos > 0:
+                for m in messages:
+                    if m.get("role") != "user":
+                        continue
+                    content = m.get("content", [])
+                    if isinstance(content, list):
+                        m["content"] = [
+                            c for c in content if not (isinstance(c, dict) and c.get("type") == "video")
+                        ]
+                num_msg_videos = _count_video_parts(messages)
+
+            if num_mm != num_msg_videos and num_mm > 0 and num_msg_videos > 0:
+                keep = min(num_mm, num_msg_videos)
+                video_inputs = video_inputs[:keep]
+                trimmed = 0
+                for m in messages:
+                    if m.get("role") != "user":
+                        continue
+                    newc = []
+                    for c in m.get("content", []):
+                        if isinstance(c, dict) and c.get("type") == "video":
+                            if trimmed < keep:
+                                newc.append(c)
+                                trimmed += 1
+                            else:
+                                continue
+                        else:
+                            newc.append(c)
+                    m["content"] = newc
+
+            payload = {
+                "prompt": text,
+                "multi_modal_data": {"video": video_inputs} if video_inputs else {},
+            }
+
             generated = self._model.generate(
-                {
-                    "prompt": text,
-                    "multi_modal_data": {"video": video_inputs},
-                },
+                payload,
                 sampling_params=self.sampling_params,
             )
             output_text = generated[0].outputs[0].text
@@ -304,113 +353,76 @@ class Qwen3VL(lmms):
         return res
 
     @staticmethod
-    def _coerce_vllm_video_payload(video_inputs: Any, default_nframes: int = 32) -> List[Any]:
-        """Return ``multi_modal_data['video']`` as primitives understood by vLLM."""
+    def _coerce_vllm_video_payload(video_inputs: Any, default_nframes: int = 32) -> List[Dict[str, Any]]:
+        """
+        Normalize the incoming "video inputs" into a list of dicts:
+            [{"video": np.ndarray[T,H,W,3]}, ...]
+        Never return raw arrays/tensors; always wrap in {"video": ...}.
+        """
+        import numpy as np  # type: ignore
 
-        try:  # pragma: no cover - optional import
-            import numpy as np  # type: ignore
-        except ImportError:  # pragma: no cover - numpy optional
-            np = None  # type: ignore
+        try:
+            import torch
+        except Exception:  # pragma: no cover - torch is optional at runtime
+            torch = None
 
-        try:  # pragma: no cover - optional import
-            import torch  # type: ignore
-        except ImportError:  # pragma: no cover - torch optional
-            torch = None  # type: ignore
+        def _as_video_array(x: Any) -> Optional[Any]:
+            if torch is not None and hasattr(torch, "is_tensor") and torch.is_tensor(x):
+                x = x.detach().cpu().numpy()
+            if getattr(x, "ndim", None) == 3:
+                x = x[None, ...]
+            return x if getattr(x, "ndim", None) == 4 else None
 
-        def _normalise_array(value: Any) -> Any:
-            if torch is not None and isinstance(value, torch.Tensor):  # type: ignore[attr-defined]
-                tensor = value.detach().cpu()
-                if tensor.ndim == 4 and tensor.shape[1] in (1, 3, 4):
-                    tensor = tensor.permute(0, 2, 3, 1).contiguous()
-                elif tensor.ndim == 3 and tensor.shape[0] in (1, 3, 4):
-                    tensor = tensor.permute(1, 2, 0).contiguous()
-                if tensor.dtype != torch.uint8:  # type: ignore[attr-defined]
-                    tensor = tensor.clamp(0, 255).to(torch.uint8)
-                value = tensor.numpy()
-
-            if np is not None and isinstance(value, np.ndarray):  # type: ignore[attr-defined]
-                array = value
-                if array.ndim == 4 and array.shape[1] in (1, 3, 4):
-                    array = array.transpose(0, 2, 3, 1)
-                elif array.ndim == 3 and array.shape[0] in (1, 3, 4):
-                    array = array.transpose(1, 2, 0)
-                elif array.ndim == 2:
-                    array = array[:, :, None]
-                if array.dtype != np.uint8:  # type: ignore[attr-defined]
-                    array = np.clip(array, 0, 255).astype(np.uint8)
-                return array
-
-            return value
-
-        def _coerce_video_value(value: Any) -> Any:
-            if value is None:
+        def _stack_frames(frames: Any) -> Optional[Any]:
+            if not isinstance(frames, list) or not frames:
                 return None
-
-            if isinstance(value, (str, bytes, bytearray)):
-                return value
-
-            if isinstance(value, Mapping):
-                entry = dict(value)
-                source = entry.get("video")
-                if source is None:
-                    source = entry.get("path")
-                if source is None:
-                    source = entry.get("frames")
-                return _coerce_video_value(source)
-
-            if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)) and not (
-                np is not None and isinstance(value, np.ndarray)  # type: ignore[attr-defined]
-            ):
-                sequence = list(value)
-                if not sequence:
+            if all(getattr(f, "ndim", None) == 3 for f in frames):
+                try:
+                    arr = np.stack(frames, axis=0)
+                    return arr
+                except Exception:
                     return None
-                if len(sequence) == 2 and isinstance(sequence[0], (str, bytes, bytearray)):
-                    return _coerce_video_value(sequence[0])
-                if np is not None:  # type: ignore[attr-defined]
-                    frames: List[Any] = []
-                    for frame in sequence:
-                        coerced = _coerce_video_value(frame)
-                        if isinstance(coerced, np.ndarray):  # type: ignore[attr-defined]
-                            if coerced.ndim == 4 and coerced.shape[0] == 1:
-                                frames.append(coerced[0])
-                            else:
-                                frames.append(coerced)
-                        else:
-                            frames.append(coerced)
-                    if frames and all(isinstance(frame, np.ndarray) and frame.ndim == 3 for frame in frames):  # type: ignore[attr-defined]
-                        stacked = np.stack(frames, axis=0)  # type: ignore[attr-defined]
-                        if stacked.dtype != np.uint8:  # type: ignore[attr-defined]
-                            stacked = np.clip(stacked, 0, 255).astype(np.uint8)  # type: ignore[attr-defined]
-                        return stacked
-                return _coerce_video_value(sequence[0])
+            return None
 
-            normalised = _normalise_array(value)
-            if np is not None and isinstance(normalised, np.ndarray):  # type: ignore[attr-defined]
-                array = normalised
-                if array.ndim == 3:
-                    return array[None, ...]
-                if array.ndim == 4:
-                    return array
-                if array.ndim == 2:
-                    return array[None, ..., None]
-            return normalised
-
+        out: List[Dict[str, Any]] = []
         if video_inputs is None:
-            return []
+            return out
 
-        if isinstance(video_inputs, Sequence) and not isinstance(video_inputs, (str, bytes, bytearray)) and not (
-            np is not None and isinstance(video_inputs, np.ndarray)  # type: ignore[attr-defined]
-        ):
-            result: List[Any] = []
-            for item in video_inputs:
-                coerced = _coerce_video_value(item)
-                if coerced is None:
-                    continue
-                result.append(coerced)
-            return result
+        if isinstance(video_inputs, list):
+            for entry in video_inputs:
+                if isinstance(entry, dict):
+                    if "frames" in entry and isinstance(entry["frames"], list):
+                        arr = _stack_frames(entry["frames"])
+                        if arr is not None:
+                            out.append({"video": arr})
+                            continue
+                    if "video" in entry:
+                        arr = _as_video_array(entry["video"])
+                        if arr is not None:
+                            out.append({"video": arr})
+                            continue
+                else:
+                    arr = _as_video_array(entry)
+                    if arr is not None:
+                        out.append({"video": arr})
+            return out
 
-        coerced = _coerce_video_value(video_inputs)
-        return [] if coerced is None else [coerced]
+        if isinstance(video_inputs, dict):
+            if "frames" in video_inputs and isinstance(video_inputs["frames"], list):
+                arr = _stack_frames(video_inputs["frames"])
+                if arr is not None:
+                    return [{"video": arr}]
+            if "video" in video_inputs:
+                arr = _as_video_array(video_inputs["video"])
+                if arr is not None:
+                    return [{"video": arr}]
+            return out
+
+        arr = _as_video_array(video_inputs)
+        if arr is not None:
+            return [{"video": arr}]
+        return out
+
 
     def loglikelihood(self, requests: List[Instance]) -> List[Tuple[float, bool]]:
         raise NotImplementedError("Log-likelihood computation is not implemented for Qwen3VL.")

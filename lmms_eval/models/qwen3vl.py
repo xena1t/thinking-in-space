@@ -28,6 +28,16 @@ try:  # pragma: no cover - optional model class
 except ImportError:  # pragma: no cover - fallback if class unavailable
     Qwen2VLForConditionalGeneration = None
 
+try:  # pragma: no cover - optional based on transformers version
+    from transformers import AutoModelForVision2Seq
+except ImportError:  # pragma: no cover - fallback for older releases
+    AutoModelForVision2Seq = None
+
+try:  # pragma: no cover - optional model class
+    from transformers import Qwen2VLForConditionalGeneration
+except ImportError:  # pragma: no cover - fallback if class unavailable
+    Qwen2VLForConditionalGeneration = None
+
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 try:  # pragma: no cover - optional dependency that is validated at runtime
@@ -243,6 +253,9 @@ class Qwen3VL(lmms):
             else:
                 torch_dtype = hf_dtype
 
+            if isinstance(device, str) and device == "cuda":
+                device = "cuda:0"
+
             hf_device_map = None
             if device_map and device_map not in ("", "cuda"):
                 hf_device_map = device_map
@@ -284,6 +297,13 @@ class Qwen3VL(lmms):
             self._model.eval()
             self.sampling_params = None
             self._hf_device_map = hf_device_map
+
+            try:
+                first_param = next(self._model.parameters())
+                model_device = first_param.device
+            except StopIteration:
+                model_device = self._device
+            print(f"[Qwen3VL] HF backend active | device_map={hf_device_map} | model_device={model_device}")
 
         self.modality = modality
         self.max_frames_num = max_frames_num

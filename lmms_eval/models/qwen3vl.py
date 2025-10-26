@@ -18,6 +18,16 @@ try:  # pragma: no cover - optional model class
 except ImportError:  # pragma: no cover - fallback if class unavailable
     Qwen2VLForConditionalGeneration = None
 
+try:  # pragma: no cover - optional based on transformers version
+    from transformers import AutoModelForVision2Seq
+except ImportError:  # pragma: no cover - fallback for older releases
+    AutoModelForVision2Seq = None
+
+try:  # pragma: no cover - optional model class
+    from transformers import Qwen2VLForConditionalGeneration
+except ImportError:  # pragma: no cover - fallback if class unavailable
+    Qwen2VLForConditionalGeneration = None
+
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 try:  # pragma: no cover - optional dependency that is validated at runtime
@@ -386,10 +396,17 @@ class Qwen3VL(lmms):
                     padding=True,
                 )
                 tensor_inputs: Dict[str, torch.Tensor] = {}
+                if self._hf_device_map is None:
+                    target_device = self._device
+                else:
+                    try:
+                        first_param = next(self._model.parameters())
+                        target_device = first_param.device
+                    except StopIteration:
+                        target_device = self._device
                 for key, value in inputs.items():
                     if isinstance(value, torch.Tensor):
-                        target_device = self.device if self._hf_device_map is None else getattr(self._model, 'device', self.device)
-                        tensor_inputs[key] = value.to(target_device)
+                        tensor_inputs[key] = value.to(target_device, non_blocking=True)
                 input_length = tensor_inputs["input_ids"].shape[-1]
                 gen_kwargs: Dict[str, Any] = {
                     "max_new_tokens": self.max_new_tokens,

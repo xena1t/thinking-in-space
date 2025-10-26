@@ -4,8 +4,9 @@ import sys
 from collections.abc import Mapping, Sequence
 from typing import Any, Dict, List, Optional, Tuple
 
+import torch
 from tqdm import tqdm
-from transformers import AutoProcessor, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
 
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
@@ -128,11 +129,12 @@ class Qwen3VL(lmms):
     """Wrapper that exposes Qwen3-VL models through the lmms-eval interface.
 
     The implementation mirrors the existing Qwen2-VL integration but allows
-    loading checkpoints from the Qwen3-VL release. The model is served through
-    vLLM for efficient batched generation and expects that the official
-    `Qwen3-VL` repository (and its qwen-vl-utils helper package) is available on
-    the python path. This matches the workflow used by the Thinking in Space
-    project for other Qwen variants.
+    loading checkpoints from the Qwen3-VL release. It can either execute through
+    vLLM or fall back to Hugging Face Transformers; the latter is the default
+    to avoid current vLLM limitations with video inputs. The wrapper still
+    expects the official `Qwen3-VL` repository (and its qwen-vl-utils helper
+    package) on the Python path, matching the workflow used by the Thinking in
+    Space project for other Qwen variants.
     """
 
     def __init__(
@@ -147,16 +149,12 @@ class Qwen3VL(lmms):
         tensor_parallel_size: Optional[int] = None,
         sampling_temperature: float = 0.0,
         max_new_tokens: int = 64,
+        use_vllm: bool = False,
+        hf_dtype: Optional[str] = "auto",
         vllm_kwargs: Optional[Dict[str, object]] = None,
         **kwargs,
     ):
         super().__init__()
-
-        if LLM is None or SamplingParams is None:
-            raise ImportError(
-                "vLLM is required for the Qwen3-VL backend. Install it with "
-                "`pip install vllm>=0.5.4` before launching the evaluation."
-            )
 
         repo_root = os.getenv("QWEN3_VL_REPO", "Qwen3-VL")
         utils_path = os.path.join(repo_root, "qwen-vl-utils", "src")
@@ -175,42 +173,74 @@ class Qwen3VL(lmms):
         self._process_vision_info = process_vision_info
 
         if kwargs:
-            # Surface unsupported kwargs early to match other model wrappers.
             unexpected = ", ".join(kwargs.keys())
             raise ValueError(f"Unexpected kwargs provided: {unexpected}")
 
         self.path = pretrained
-        tensor_parallel = tensor_parallel_size or int(os.getenv("VLLM_TENSOR_PARALLISM", 1))
-        vllm_kwargs = vllm_kwargs.copy() if vllm_kwargs else {}
-        vllm_kwargs.setdefault("tensor_parallel_size", tensor_parallel)
-        vllm_kwargs.setdefault("max_model_len", max_model_len)
-        # trust_remote_code is required for Qwen releases and can still be
-        # overridden through `vllm_kwargs` when necessary.
-        vllm_kwargs.setdefault("trust_remote_code", True)
+        self.use_vllm = bool(use_vllm)
+        self.temperature = float(sampling_temperature)
+        self.max_new_tokens = int(max_new_tokens)
 
-        self._ensure_spawn_start_method()
-        _patch_vllm_qwen3_metadata_guard()
-        self._model = LLM(self.path, **vllm_kwargs)
         self._processor = AutoProcessor.from_pretrained(self.path, trust_remote_code=True)
         self._tokenizer = AutoTokenizer.from_pretrained(self.path, trust_remote_code=True)
 
-        self.sampling_params = SamplingParams(temperature=sampling_temperature, max_tokens=max_new_tokens)
-
-        batch_size = int(batch_size)
-        if batch_size != 1:
+        batch_size_int = int(batch_size)
+        if batch_size_int != 1:
             raise AssertionError(
-                f"Batch size should be 1 for Qwen3VL, but got {batch_size}."
+                f"Batch size should be 1 for Qwen3VL, but got {batch_size_int}."
             )
-        self.batch_size_per_gpu = batch_size
+        self.batch_size_per_gpu = batch_size_int
 
         self._config = None
-        self._device = device
         self._rank = 0
         self._world_size = 1
+        self._hf_device_map: Optional[Any] = None
+
+        if self.use_vllm:
+            if LLM is None or SamplingParams is None:
+                raise ImportError(
+                    "vLLM is required for the Qwen3-VL backend. Install it with "
+                    "`pip install vllm>=0.5.4` before launching the evaluation, or "
+                    "set use_vllm=False to run with the Transformers backend."
+                )
+
+            tensor_parallel = tensor_parallel_size or int(os.getenv("VLLM_TENSOR_PARALLISM", 1))
+            vllm_kwargs = vllm_kwargs.copy() if vllm_kwargs else {}
+            vllm_kwargs.setdefault("tensor_parallel_size", tensor_parallel)
+            vllm_kwargs.setdefault("max_model_len", max_model_len)
+            vllm_kwargs.setdefault("trust_remote_code", True)
+
+            self._ensure_spawn_start_method()
+            _patch_vllm_qwen3_metadata_guard()
+            self._model = LLM(self.path, **vllm_kwargs)
+            self.sampling_params = SamplingParams(temperature=self.temperature, max_tokens=self.max_new_tokens)
+            self._device = device
+        else:
+            if hf_dtype is None or hf_dtype == "auto":
+                torch_dtype = "auto"
+            elif isinstance(hf_dtype, str):
+                torch_dtype = getattr(torch, hf_dtype)
+            else:
+                torch_dtype = hf_dtype
+
+            hf_device_map = None
+            if device_map and device_map not in ("", "cuda"):
+                hf_device_map = device_map
+            self._device = torch.device(device)
+            self._model = AutoModelForCausalLM.from_pretrained(
+                self.path,
+                trust_remote_code=True,
+                torch_dtype=torch_dtype,
+                device_map=hf_device_map,
+            )
+            if hf_device_map is None:
+                self._model.to(self._device)
+            self._model.eval()
+            self.sampling_params = None
+            self._hf_device_map = hf_device_map
 
         self.modality = modality
         self.max_frames_num = max_frames_num
-
     @staticmethod
     def _ensure_spawn_start_method() -> None:
         method = mp.get_start_method(allow_none=True)
@@ -287,77 +317,143 @@ class Qwen3VL(lmms):
                 messages, tokenize=False, add_generation_prompt=True
             )
             _, raw_video_inputs = self._process_vision_info(messages)
-            fallback_entry = {"video": str(video_path)}
-            if self.max_frames_num:
-                fallback_entry["nframes"] = self.max_frames_num
-            if not raw_video_inputs:
-                raw_video_inputs = [fallback_entry]
-            video_inputs = self._coerce_vllm_video_payload(
-                raw_video_inputs,
-                default_nframes=self.max_frames_num or 32,
-            )
-            if not video_inputs:
-                video_inputs = [fallback_entry]
-            # --- ENFORCE 1: keep messages/video content count in sync with multi_modal_data ---
-            def _count_video_parts(msgs: List[Dict[str, Any]]) -> int:
-                cnt = 0
-                for m in msgs:
-                    if m.get("role") != "user":
-                        continue
-                    content = m.get("content", [])
-                    if isinstance(content, list):
-                        for c in content:
-                            if isinstance(c, dict) and c.get("type") == "video":
-                                cnt += 1
-                return cnt
+            if self.use_vllm:
+                fallback_entry = {"video": str(video_path)}
+                if self.max_frames_num:
+                    fallback_entry["nframes"] = self.max_frames_num
+                if not raw_video_inputs:
+                    raw_video_inputs = [fallback_entry]
+                video_inputs = self._coerce_vllm_video_payload(
+                    raw_video_inputs,
+                    default_nframes=self.max_frames_num or 32,
+                )
+                if not video_inputs:
+                    video_inputs = [fallback_entry]
+                payload = {
+                    "prompt": text,
+                    "multi_modal_data": {"video": video_inputs} if video_inputs else {},
+                }
 
-            num_mm = len(video_inputs)
-            num_msg_videos = _count_video_parts(messages)
+                generated = self._model.generate(
+                    payload,
+                    sampling_params=self.sampling_params,
+                )
+                output_text = generated[0].outputs[0].text
+            else:
+                video_tensors = self._prepare_hf_video_inputs(raw_video_inputs, video_path)
+                if not video_tensors:
+                    raise RuntimeError(f"Failed to load video frames for {video_path}.")
+                inputs = self._processor(
+                    text=[text],
+                    videos=video_tensors,
+                    return_tensors="pt",
+                    padding=True,
+                )
+                tensor_inputs: Dict[str, torch.Tensor] = {}
+                for key, value in inputs.items():
+                    if isinstance(value, torch.Tensor):
+                        target_device = self.device if self._hf_device_map is None else getattr(self._model, 'device', self.device)
+                        tensor_inputs[key] = value.to(target_device)
+                input_length = tensor_inputs["input_ids"].shape[-1]
+                gen_kwargs: Dict[str, Any] = {
+                    "max_new_tokens": self.max_new_tokens,
+                    "pad_token_id": self._tokenizer.eos_token_id,
+                    "eos_token_id": self._tokenizer.eos_token_id,
+                }
+                if self.temperature > 0:
+                    gen_kwargs.update({"do_sample": True, "temperature": self.temperature})
+                else:
+                    gen_kwargs.update({"do_sample": False})
 
-            if num_mm == 0 and num_msg_videos > 0:
-                for m in messages:
-                    if m.get("role") != "user":
-                        continue
-                    content = m.get("content", [])
-                    if isinstance(content, list):
-                        m["content"] = [
-                            c for c in content if not (isinstance(c, dict) and c.get("type") == "video")
-                        ]
-                num_msg_videos = _count_video_parts(messages)
-
-            if num_mm != num_msg_videos and num_mm > 0 and num_msg_videos > 0:
-                keep = min(num_mm, num_msg_videos)
-                video_inputs = video_inputs[:keep]
-                trimmed = 0
-                for m in messages:
-                    if m.get("role") != "user":
-                        continue
-                    newc = []
-                    for c in m.get("content", []):
-                        if isinstance(c, dict) and c.get("type") == "video":
-                            if trimmed < keep:
-                                newc.append(c)
-                                trimmed += 1
-                            else:
-                                continue
-                        else:
-                            newc.append(c)
-                    m["content"] = newc
-
-            payload = {
-                "prompt": text,
-                "multi_modal_data": {"video": video_inputs} if video_inputs else {},
-            }
-
-            generated = self._model.generate(
-                payload,
-                sampling_params=self.sampling_params,
-            )
-            output_text = generated[0].outputs[0].text
+                with torch.no_grad():
+                    generated_ids = self._model.generate(**tensor_inputs, **gen_kwargs)
+                new_tokens = generated_ids[:, input_length:]
+                output_text = self._tokenizer.batch_decode(new_tokens, skip_special_tokens=True)[0].strip()
             res.append(output_text)
             pbar.update(1)
         pbar.close()
         return res
+
+    def _prepare_hf_video_inputs(
+        self, raw_video_inputs: List[Any], video_path: str
+    ) -> List[Any]:
+        if raw_video_inputs:
+            prepared: List[Any] = []
+            for entry in raw_video_inputs:
+                if isinstance(entry, dict):
+                    if entry.get("video") is not None:
+                        prepared.append(entry["video"])
+                    elif entry.get("frames"):
+                        stacked = self._stack_frames(entry["frames"])
+                        if stacked is not None:
+                            prepared.append(stacked)
+                else:
+                    prepared.append(entry)
+            prepared = [item for item in prepared if item is not None]
+            if prepared:
+                return prepared
+        fallback = self._load_video_frames(video_path, self.max_frames_num)
+        return [fallback] if fallback is not None else []
+
+    @staticmethod
+    def _stack_frames(frames: Sequence[Any]) -> Optional[Any]:
+        try:
+            import numpy as np  # type: ignore
+        except Exception:  # pragma: no cover - numpy optional
+            return None
+
+        valid_frames = [frame for frame in frames if getattr(frame, "ndim", None) == 3]
+        if not valid_frames:
+            return None
+        try:
+            stacked = np.stack(valid_frames, axis=0)
+        except Exception:
+            return None
+        return stacked
+
+    @staticmethod
+    def _load_video_frames(video_path: str, max_frames: Optional[int]) -> Optional[Any]:
+        try:
+            import decord  # type: ignore
+            import numpy as np  # type: ignore
+        except Exception:  # pragma: no cover - decord optional
+            decord = None  # type: ignore
+
+        if decord is not None:
+            try:
+                vr = decord.VideoReader(video_path)
+                total = len(vr)
+                if total == 0:
+                    return None
+                if max_frames and max_frames > 0:
+                    indices = np.linspace(0, total - 1, num=min(max_frames, total), dtype=int)
+                else:
+                    indices = list(range(total))
+                frames = vr.get_batch(indices).asnumpy()
+                return frames
+            except Exception:
+                pass
+
+        try:
+            import imageio.v3 as imageio  # type: ignore
+            import numpy as np  # type: ignore
+        except Exception:  # pragma: no cover - imageio optional
+            imageio = None  # type: ignore
+
+        if imageio is not None:
+            try:
+                frames_iter = imageio.imiter(video_path)
+                frames = []
+                for idx, frame in enumerate(frames_iter):
+                    frames.append(frame)
+                    if max_frames and max_frames > 0 and idx + 1 >= max_frames:
+                        break
+                if frames:
+                    return np.stack(frames, axis=0)
+            except Exception:
+                return None
+
+        return None
 
     @staticmethod
     def _coerce_vllm_video_payload(video_inputs: Any, default_nframes: int = 32) -> List[Dict[str, Any]]:
@@ -385,7 +481,6 @@ class Qwen3VL(lmms):
                     return entry
             return None
 
-        out: List[Dict[str, Any]] = []
         if video_inputs is None:
             return []
 

@@ -385,6 +385,7 @@ class Qwen3VL(lmms):
                     return entry
             return None
 
+        out: List[Dict[str, Any]] = []
         if video_inputs is None:
             return []
 

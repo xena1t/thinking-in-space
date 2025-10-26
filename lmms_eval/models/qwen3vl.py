@@ -60,7 +60,8 @@ def _patch_vllm_qwen3_metadata_guard() -> None:
         return  # already patched upstream
 
     # Ensure metadata lookups are safe when ``metadata`` is ``None``.
-    patched_source = source.replace("metadata.get(", "(metadata or {}).get(")
+    metadata_guard_pattern = re.compile(r"metadata\s*\.\s*get\(")
+    patched_source = metadata_guard_pattern.sub("(metadata or {}).get(", source)
 
     # Strengthen the VideoMetadata construction with inferred defaults.
     pattern = re.compile(

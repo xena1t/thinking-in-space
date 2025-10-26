@@ -8,6 +8,16 @@ import torch
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
 
+try:  # pragma: no cover - optional based on transformers version
+    from transformers import AutoModelForVision2Seq
+except ImportError:  # pragma: no cover - fallback for older releases
+    AutoModelForVision2Seq = None
+
+try:  # pragma: no cover - optional model class
+    from transformers import Qwen2VLForConditionalGeneration
+except ImportError:  # pragma: no cover - fallback if class unavailable
+    Qwen2VLForConditionalGeneration = None
+
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 try:  # pragma: no cover - optional dependency that is validated at runtime
@@ -227,12 +237,38 @@ class Qwen3VL(lmms):
             if device_map and device_map not in ("", "cuda"):
                 hf_device_map = device_map
             self._device = torch.device(device)
-            self._model = AutoModelForCausalLM.from_pretrained(
-                self.path,
-                trust_remote_code=True,
-                torch_dtype=torch_dtype,
-                device_map=hf_device_map,
-            )
+
+            model_kwargs = {
+                "trust_remote_code": True,
+                "torch_dtype": torch_dtype,
+                "device_map": hf_device_map,
+            }
+
+            model_loaded = False
+            model_exceptions: List[Exception] = []
+
+            if AutoModelForVision2Seq is not None:
+                try:
+                    self._model = AutoModelForVision2Seq.from_pretrained(self.path, **model_kwargs)
+                    model_loaded = True
+                except Exception as exc:  # pragma: no cover - fall back to specific class
+                    model_exceptions.append(exc)
+
+            if not model_loaded and Qwen2VLForConditionalGeneration is not None:
+                try:
+                    self._model = Qwen2VLForConditionalGeneration.from_pretrained(self.path, **model_kwargs)
+                    model_loaded = True
+                except Exception as exc:  # pragma: no cover - propagate below
+                    model_exceptions.append(exc)
+
+            if not model_loaded:
+                error_messages = "; ".join(str(exc) for exc in model_exceptions) or "No compatible vision-language model class available."
+                raise ValueError(
+                    "Failed to load Qwen3-VL model with the Transformers backend. "
+                    "Ensure your transformers version provides AutoModelForVision2Seq or Qwen2VLForConditionalGeneration. "
+                    f"Underlying errors: {error_messages}"
+                )
+
             if hf_device_map is None:
                 self._model.to(self._device)
             self._model.eval()

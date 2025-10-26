@@ -286,11 +286,18 @@ class Qwen3VL(lmms):
             text = self._processor.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True
             )
-            _, video_inputs = self._process_vision_info(messages)
+            _, raw_video_inputs = self._process_vision_info(messages)
+            fallback_entry = {"video": str(video_path)}
+            if self.max_frames_num:
+                fallback_entry["nframes"] = self.max_frames_num
+            if not raw_video_inputs:
+                raw_video_inputs = [fallback_entry]
             video_inputs = self._coerce_vllm_video_payload(
-                video_inputs,
+                raw_video_inputs,
                 default_nframes=self.max_frames_num or 32,
             )
+            if not video_inputs:
+                video_inputs = [fallback_entry]
             # --- ENFORCE 1: keep messages/video content count in sync with multi_modal_data ---
             def _count_video_parts(msgs: List[Dict[str, Any]]) -> int:
                 cnt = 0
@@ -355,73 +362,43 @@ class Qwen3VL(lmms):
     @staticmethod
     def _coerce_vllm_video_payload(video_inputs: Any, default_nframes: int = 32) -> List[Dict[str, Any]]:
         """
-        Normalize the incoming "video inputs" into a list of dicts:
-            [{"video": np.ndarray[T,H,W,3]}, ...]
-        Never return raw arrays/tensors; always wrap in {"video": ...}.
+        Normalize arbitrary "video inputs" into a vLLM-friendly payload that only
+        references on-disk videos. Frames, tensors, and arrays are discarded so the
+        downstream parser never receives inline pixel buffers (which vLLM rejects).
         """
-        import numpy as np  # type: ignore
+        import os
 
-        try:
-            import torch
-        except Exception:  # pragma: no cover - torch is optional at runtime
-            torch = None
+        def _to_path_entry(value: Any) -> Optional[Dict[str, Any]]:
+            if isinstance(value, dict):
+                candidate = value.get("video") or value.get("video_path") or value.get("path")
+            else:
+                candidate = value
 
-        def _as_video_array(x: Any) -> Optional[Any]:
-            if torch is not None and hasattr(torch, "is_tensor") and torch.is_tensor(x):
-                x = x.detach().cpu().numpy()
-            if getattr(x, "ndim", None) == 3:
-                x = x[None, ...]
-            return x if getattr(x, "ndim", None) == 4 else None
-
-        def _stack_frames(frames: Any) -> Optional[Any]:
-            if not isinstance(frames, list) or not frames:
-                return None
-            if all(getattr(f, "ndim", None) == 3 for f in frames):
-                try:
-                    arr = np.stack(frames, axis=0)
-                    return arr
-                except Exception:
-                    return None
+            if isinstance(candidate, (str, os.PathLike)):
+                path_str = os.fspath(candidate)
+                if path_str:
+                    entry: Dict[str, Any] = {"video": path_str}
+                    if isinstance(value, dict) and isinstance(value.get("nframes"), int):
+                        entry["nframes"] = value["nframes"]
+                    elif isinstance(default_nframes, int) and default_nframes > 0:
+                        entry["nframes"] = default_nframes
+                    return entry
             return None
 
         out: List[Dict[str, Any]] = []
         if video_inputs is None:
-            return out
+            return []
 
         if isinstance(video_inputs, list):
-            for entry in video_inputs:
-                if isinstance(entry, dict):
-                    if "frames" in entry and isinstance(entry["frames"], list):
-                        arr = _stack_frames(entry["frames"])
-                        if arr is not None:
-                            out.append({"video": arr})
-                            continue
-                    if "video" in entry:
-                        arr = _as_video_array(entry["video"])
-                        if arr is not None:
-                            out.append({"video": arr})
-                            continue
-                else:
-                    arr = _as_video_array(entry)
-                    if arr is not None:
-                        out.append({"video": arr})
-            return out
+            coerced: List[Dict[str, Any]] = []
+            for item in video_inputs:
+                entry = _to_path_entry(item)
+                if entry:
+                    coerced.append(entry)
+            return coerced
 
-        if isinstance(video_inputs, dict):
-            if "frames" in video_inputs and isinstance(video_inputs["frames"], list):
-                arr = _stack_frames(video_inputs["frames"])
-                if arr is not None:
-                    return [{"video": arr}]
-            if "video" in video_inputs:
-                arr = _as_video_array(video_inputs["video"])
-                if arr is not None:
-                    return [{"video": arr}]
-            return out
-
-        arr = _as_video_array(video_inputs)
-        if arr is not None:
-            return [{"video": arr}]
-        return out
+        entry = _to_path_entry(video_inputs)
+        return [entry] if entry else []
 
 
     def loglikelihood(self, requests: List[Instance]) -> List[Tuple[float, bool]]:

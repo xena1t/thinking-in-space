@@ -41,14 +41,13 @@ from lmms_eval.utils import (
     make_table,
     simple_parse_args_string,
 )
-if os.getenv('LMMS_EVAL_LAUNCHER', None) == "accelerate":
-    print("This script was launched with accelerate")
-    IS_ACCELERATE_LAUNCHED=True    
-elif os.getenv('LMMS_EVAL_LAUNCHER', None) == "python":
-    print("This script was launched with python")
-    IS_ACCELERATE_LAUNCHED=False
+launcher_env = (os.getenv("LMMS_EVAL_LAUNCHER", "python") or "python").lower()
+if launcher_env in {"accelerate", "acc"}:
+    print("Launcher detected: accelerate")
+    IS_ACCELERATE_LAUNCHED = True
 else:
-    raise NotImplementedError("Unknown launch method.")
+    print("Launcher detected: python (default)")
+    IS_ACCELERATE_LAUNCHED = False
 
 
 def _int_or_none_list_arg_type(min_len: int, max_len: int, defaults: str, value: str, split_char: str = ","):

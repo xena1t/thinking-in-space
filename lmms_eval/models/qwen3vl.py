@@ -4,8 +4,19 @@ import sys
 from collections.abc import Mapping, Sequence
 from typing import Any, Dict, List, Optional, Tuple
 
+import torch
 from tqdm import tqdm
 from transformers import AutoProcessor, AutoTokenizer
+
+try:  # pragma: no cover - optional based on transformers version
+    from transformers import AutoModelForVision2Seq
+except ImportError:  # pragma: no cover - fallback for older releases
+    AutoModelForVision2Seq = None
+
+try:  # pragma: no cover - optional model class
+    from transformers import Qwen2VLForConditionalGeneration
+except ImportError:  # pragma: no cover - fallback if class unavailable
+    Qwen2VLForConditionalGeneration = None
 
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
@@ -60,7 +71,8 @@ def _patch_vllm_qwen3_metadata_guard() -> None:
         return  # already patched upstream
 
     # Ensure metadata lookups are safe when ``metadata`` is ``None``.
-    patched_source = source.replace("metadata.get(", "(metadata or {}).get(")
+    metadata_guard_pattern = re.compile(r"metadata\s*\.\s*get\(")
+    patched_source = metadata_guard_pattern.sub("(metadata or {}).get(", source)
 
     # Strengthen the VideoMetadata construction with inferred defaults.
     pattern = re.compile(
@@ -127,11 +139,12 @@ class Qwen3VL(lmms):
     """Wrapper that exposes Qwen3-VL models through the lmms-eval interface.
 
     The implementation mirrors the existing Qwen2-VL integration but allows
-    loading checkpoints from the Qwen3-VL release. The model is served through
-    vLLM for efficient batched generation and expects that the official
-    `Qwen3-VL` repository (and its qwen-vl-utils helper package) is available on
-    the python path. This matches the workflow used by the Thinking in Space
-    project for other Qwen variants.
+    loading checkpoints from the Qwen3-VL release. It can either execute through
+    vLLM or fall back to Hugging Face Transformers; the latter is the default
+    to avoid current vLLM limitations with video inputs. The wrapper still
+    expects the official `Qwen3-VL` repository (and its qwen-vl-utils helper
+    package) on the Python path, matching the workflow used by the Thinking in
+    Space project for other Qwen variants.
     """
 
     def __init__(
@@ -146,16 +159,12 @@ class Qwen3VL(lmms):
         tensor_parallel_size: Optional[int] = None,
         sampling_temperature: float = 0.0,
         max_new_tokens: int = 64,
+        use_vllm: bool = False,
+        hf_dtype: Optional[str] = "auto",
         vllm_kwargs: Optional[Dict[str, object]] = None,
         **kwargs,
     ):
         super().__init__()
-
-        if LLM is None or SamplingParams is None:
-            raise ImportError(
-                "vLLM is required for the Qwen3-VL backend. Install it with "
-                "`pip install vllm>=0.5.4` before launching the evaluation."
-            )
 
         repo_root = os.getenv("QWEN3_VL_REPO", "Qwen3-VL")
         utils_path = os.path.join(repo_root, "qwen-vl-utils", "src")
@@ -173,43 +182,148 @@ class Qwen3VL(lmms):
             ) from exc
         self._process_vision_info = process_vision_info
 
+        kwargs = dict(kwargs)
+        trust_remote_code = bool(kwargs.pop("trust_remote_code", True))
+        dtype_alias = kwargs.pop("dtype", None)
+        torch_dtype_alias = kwargs.pop("torch_dtype", None)
+
+        if dtype_alias is not None:
+            hf_dtype = dtype_alias
+        elif (
+            torch_dtype_alias is not None
+            and (hf_dtype is None or hf_dtype == "auto")
+        ):
+            hf_dtype = torch_dtype_alias
+
         if kwargs:
-            # Surface unsupported kwargs early to match other model wrappers.
             unexpected = ", ".join(kwargs.keys())
             raise ValueError(f"Unexpected kwargs provided: {unexpected}")
 
         self.path = pretrained
-        tensor_parallel = tensor_parallel_size or int(os.getenv("VLLM_TENSOR_PARALLISM", 1))
-        vllm_kwargs = vllm_kwargs.copy() if vllm_kwargs else {}
-        vllm_kwargs.setdefault("tensor_parallel_size", tensor_parallel)
-        vllm_kwargs.setdefault("max_model_len", max_model_len)
-        # trust_remote_code is required for Qwen releases and can still be
-        # overridden through `vllm_kwargs` when necessary.
-        vllm_kwargs.setdefault("trust_remote_code", True)
+        self.use_vllm = bool(use_vllm)
+        self.temperature = float(sampling_temperature)
+        self.max_new_tokens = int(max_new_tokens)
 
-        self._ensure_spawn_start_method()
-        _patch_vllm_qwen3_metadata_guard()
-        self._model = LLM(self.path, **vllm_kwargs)
-        self._processor = AutoProcessor.from_pretrained(self.path, trust_remote_code=True)
-        self._tokenizer = AutoTokenizer.from_pretrained(self.path, trust_remote_code=True)
+        self._processor = AutoProcessor.from_pretrained(
+            self.path, trust_remote_code=trust_remote_code
+        )
+        self._tokenizer = AutoTokenizer.from_pretrained(
+            self.path, trust_remote_code=trust_remote_code
+        )
 
-        self.sampling_params = SamplingParams(temperature=sampling_temperature, max_tokens=max_new_tokens)
-
-        batch_size = int(batch_size)
-        if batch_size != 1:
+        batch_size_int = int(batch_size)
+        if batch_size_int != 1:
             raise AssertionError(
-                f"Batch size should be 1 for Qwen3VL, but got {batch_size}."
+                f"Batch size should be 1 for Qwen3VL, but got {batch_size_int}."
             )
-        self.batch_size_per_gpu = batch_size
+        self.batch_size_per_gpu = batch_size_int
 
         self._config = None
-        self._device = device
         self._rank = 0
         self._world_size = 1
+        self._hf_device_map: Optional[Any] = None
+
+        if self.use_vllm:
+            if LLM is None or SamplingParams is None:
+                raise ImportError(
+                    "vLLM is required for the Qwen3-VL backend. Install it with "
+                    "`pip install vllm>=0.5.4` before launching the evaluation, or "
+                    "set use_vllm=False to run with the Transformers backend."
+                )
+
+            tensor_parallel = tensor_parallel_size or int(os.getenv("VLLM_TENSOR_PARALLISM", 1))
+            vllm_kwargs = vllm_kwargs.copy() if vllm_kwargs else {}
+            vllm_kwargs.setdefault("tensor_parallel_size", tensor_parallel)
+            vllm_kwargs.setdefault("max_model_len", max_model_len)
+            vllm_kwargs.setdefault("trust_remote_code", True)
+
+            self._ensure_spawn_start_method()
+            _patch_vllm_qwen3_metadata_guard()
+            self._model = LLM(self.path, **vllm_kwargs)
+            self.sampling_params = SamplingParams(temperature=self.temperature, max_tokens=self.max_new_tokens)
+            self._device = device
+        else:
+            if hf_dtype is None or hf_dtype == "auto":
+                torch_dtype = "auto"
+            elif isinstance(hf_dtype, str):
+                torch_dtype = getattr(torch, hf_dtype)
+            else:
+                torch_dtype = hf_dtype
+
+            if isinstance(device, str) and device == "cuda":
+                device = "cuda:0"
+
+            hf_device_map = None
+            if device_map:
+                normalized = device_map
+                if isinstance(normalized, str):
+                    lowered = normalized.lower()
+                    if lowered in {"auto", "cuda", "cuda:0"}:
+                        print(
+                            f"[Qwen3VL] device_map={normalized!r} treated as single-GPU load; model weights will be placed on {device}"
+                        )
+                        normalized = None
+                    elif lowered.startswith("cuda:") and lowered.count(":") == 1:
+                        pass  # explicit cuda:N device map respected
+                    else:
+                        print(
+                            f"[Qwen3VL] Unrecognized device_map={device_map!r}; using it as provided"
+                        )
+                        normalized = device_map
+                hf_device_map = normalized
+            self._device = torch.device(device)
+
+            model_kwargs = {
+                "trust_remote_code": trust_remote_code,
+                "torch_dtype": torch_dtype,
+                "device_map": hf_device_map,
+            }
+            if hf_device_map is None:
+                model_kwargs.pop("device_map")
+
+            model_loaded = False
+            model_exceptions: List[Exception] = []
+
+            if AutoModelForVision2Seq is not None:
+                try:
+                    self._model = AutoModelForVision2Seq.from_pretrained(self.path, **model_kwargs)
+                    model_loaded = True
+                except Exception as exc:  # pragma: no cover - fall back to specific class
+                    model_exceptions.append(exc)
+
+            if not model_loaded and Qwen2VLForConditionalGeneration is not None:
+                try:
+                    self._model = Qwen2VLForConditionalGeneration.from_pretrained(self.path, **model_kwargs)
+                    model_loaded = True
+                except Exception as exc:  # pragma: no cover - propagate below
+                    model_exceptions.append(exc)
+
+            if not model_loaded:
+                error_messages = "; ".join(str(exc) for exc in model_exceptions) or "No compatible vision-language model class available."
+                raise ValueError(
+                    "Failed to load Qwen3-VL model with the Transformers backend. "
+                    "Ensure your transformers version provides AutoModelForVision2Seq or Qwen2VLForConditionalGeneration. "
+                    f"Underlying errors: {error_messages}"
+                )
+
+            if hf_device_map is None:
+                if self._device.type == "cuda" and torch.cuda.is_available():
+                    torch.cuda.set_device(self._device)
+                self._model = self._model.to(self._device)
+            self._model.eval()
+            self.sampling_params = None
+            inferred_map = getattr(self._model, "hf_device_map", None)
+            self._hf_device_map = inferred_map or hf_device_map
+
+            try:
+                first_param = next(self._model.parameters())
+                model_device = first_param.device
+            except StopIteration:
+                model_device = self._device
+            print(f"[Qwen3VL] HF backend active | device_map={self._hf_device_map} | model_device={model_device}")
 
         self.modality = modality
         self.max_frames_num = max_frames_num
-
     @staticmethod
     def _ensure_spawn_start_method() -> None:
         method = mp.get_start_method(allow_none=True)
@@ -285,132 +399,208 @@ class Qwen3VL(lmms):
             text = self._processor.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True
             )
-            _, video_inputs = self._process_vision_info(messages)
-            video_inputs = self._coerce_vllm_video_payload(
-                video_inputs,
-                default_nframes=self.max_frames_num or 32,
-            )
-            generated = self._model.generate(
-                {
+            _, raw_video_inputs = self._process_vision_info(messages)
+            if self.use_vllm:
+                fallback_entry = {"video": str(video_path)}
+                if self.max_frames_num:
+                    fallback_entry["nframes"] = self.max_frames_num
+                if not raw_video_inputs:
+                    raw_video_inputs = [fallback_entry]
+                video_inputs = self._coerce_vllm_video_payload(
+                    raw_video_inputs,
+                    default_nframes=self.max_frames_num or 32,
+                )
+                if not video_inputs:
+                    video_inputs = [fallback_entry]
+                payload = {
                     "prompt": text,
-                    "multi_modal_data": {"video": video_inputs},
-                },
-                sampling_params=self.sampling_params,
-            )
-            output_text = generated[0].outputs[0].text
+                    "multi_modal_data": {"video": video_inputs} if video_inputs else {},
+                }
+
+                generated = self._model.generate(
+                    payload,
+                    sampling_params=self.sampling_params,
+                )
+                output_text = generated[0].outputs[0].text
+            else:
+                video_tensors = self._prepare_hf_video_inputs(raw_video_inputs, video_path)
+                if not video_tensors:
+                    raise RuntimeError(f"Failed to load video frames for {video_path}.")
+                inputs = self._processor(
+                    text=[text],
+                    videos=video_tensors,
+                    return_tensors="pt",
+                    padding=True,
+                )
+                tensor_inputs: Dict[str, torch.Tensor] = {}
+                target_device = self._resolve_tensor_device()
+                for key, value in inputs.items():
+                    if isinstance(value, torch.Tensor):
+                        tensor_inputs[key] = value.to(target_device, non_blocking=True)
+                input_length = tensor_inputs["input_ids"].shape[-1]
+                gen_kwargs: Dict[str, Any] = {
+                    "max_new_tokens": self.max_new_tokens,
+                    "pad_token_id": self._tokenizer.eos_token_id,
+                    "eos_token_id": self._tokenizer.eos_token_id,
+                }
+                if self.temperature > 0:
+                    gen_kwargs.update({"do_sample": True, "temperature": self.temperature})
+                else:
+                    gen_kwargs.update({"do_sample": False})
+
+                with torch.no_grad():
+                    generated_ids = self._model.generate(**tensor_inputs, **gen_kwargs)
+                new_tokens = generated_ids[:, input_length:]
+                output_text = self._tokenizer.batch_decode(new_tokens, skip_special_tokens=True)[0].strip()
             res.append(output_text)
             pbar.update(1)
         pbar.close()
         return res
 
+    def _resolve_tensor_device(self) -> torch.device:
+        if isinstance(self._hf_device_map, dict) and self._hf_device_map:
+            for device in self._hf_device_map.values():
+                if isinstance(device, str) and device.startswith('cuda'):
+                    return torch.device(device)
+                if isinstance(device, int):
+                    return torch.device(f'cuda:{device}')
+                if isinstance(device, torch.device):
+                    return device
+        elif isinstance(self._hf_device_map, str) and self._hf_device_map:
+            if self._hf_device_map == 'cuda':
+                return torch.device('cuda:0')
+            if self._hf_device_map.startswith('cuda'):
+                return torch.device(self._hf_device_map)
+        model_device = getattr(self._model, 'device', None)
+        if isinstance(model_device, torch.device):
+            return model_device
+        if isinstance(model_device, str) and model_device:
+            return torch.device(model_device)
+        if self._device is not None:
+            return self._device
+        return torch.device('cpu')
+
+    def _prepare_hf_video_inputs(
+        self, raw_video_inputs: List[Any], video_path: str
+    ) -> List[Any]:
+        if raw_video_inputs:
+            prepared: List[Any] = []
+            for entry in raw_video_inputs:
+                if isinstance(entry, dict):
+                    if entry.get("video") is not None:
+                        prepared.append(entry["video"])
+                    elif entry.get("frames"):
+                        stacked = self._stack_frames(entry["frames"])
+                        if stacked is not None:
+                            prepared.append(stacked)
+                else:
+                    prepared.append(entry)
+            prepared = [item for item in prepared if item is not None]
+            if prepared:
+                return prepared
+        fallback = self._load_video_frames(video_path, self.max_frames_num)
+        return [fallback] if fallback is not None else []
+
     @staticmethod
-    def _coerce_vllm_video_payload(video_inputs: Any, default_nframes: int = 32) -> List[Any]:
-        """Return ``multi_modal_data['video']`` as primitives understood by vLLM."""
-
-        try:  # pragma: no cover - optional import
+    def _stack_frames(frames: Sequence[Any]) -> Optional[Any]:
+        try:
             import numpy as np  # type: ignore
-        except ImportError:  # pragma: no cover - numpy optional
-            np = None  # type: ignore
+        except Exception:  # pragma: no cover - numpy optional
+            return None
 
-        try:  # pragma: no cover - optional import
-            import torch  # type: ignore
-        except ImportError:  # pragma: no cover - torch optional
-            torch = None  # type: ignore
+        valid_frames = [frame for frame in frames if getattr(frame, "ndim", None) == 3]
+        if not valid_frames:
+            return None
+        try:
+            stacked = np.stack(valid_frames, axis=0)
+        except Exception:
+            return None
+        return stacked
 
-        def _normalise_array(value: Any) -> Any:
-            if torch is not None and isinstance(value, torch.Tensor):  # type: ignore[attr-defined]
-                tensor = value.detach().cpu()
-                if tensor.ndim == 4 and tensor.shape[1] in (1, 3, 4):
-                    tensor = tensor.permute(0, 2, 3, 1).contiguous()
-                elif tensor.ndim == 3 and tensor.shape[0] in (1, 3, 4):
-                    tensor = tensor.permute(1, 2, 0).contiguous()
-                if tensor.dtype != torch.uint8:  # type: ignore[attr-defined]
-                    tensor = tensor.clamp(0, 255).to(torch.uint8)
-                value = tensor.numpy()
+    @staticmethod
+    def _load_video_frames(video_path: str, max_frames: Optional[int]) -> Optional[Any]:
+        try:
+            import decord  # type: ignore
+            import numpy as np  # type: ignore
+        except Exception:  # pragma: no cover - decord optional
+            decord = None  # type: ignore
 
-            if np is not None and isinstance(value, np.ndarray):  # type: ignore[attr-defined]
-                array = value
-                if array.ndim == 4 and array.shape[1] in (1, 3, 4):
-                    array = array.transpose(0, 2, 3, 1)
-                elif array.ndim == 3 and array.shape[0] in (1, 3, 4):
-                    array = array.transpose(1, 2, 0)
-                elif array.ndim == 2:
-                    array = array[:, :, None]
-                if array.dtype != np.uint8:  # type: ignore[attr-defined]
-                    array = np.clip(array, 0, 255).astype(np.uint8)
-                return array
+        if decord is not None:
+            try:
+                vr = decord.VideoReader(video_path)
+                total = len(vr)
+                if total == 0:
+                    return None
+                if max_frames and max_frames > 0:
+                    indices = np.linspace(0, total - 1, num=min(max_frames, total), dtype=int)
+                else:
+                    indices = list(range(total))
+                frames = vr.get_batch(indices).asnumpy()
+                return frames
+            except Exception:
+                pass
 
-            return value
+        try:
+            import imageio.v3 as imageio  # type: ignore
+            import numpy as np  # type: ignore
+        except Exception:  # pragma: no cover - imageio optional
+            imageio = None  # type: ignore
 
-        def _coerce_video_value(value: Any) -> Any:
-            if value is None:
+        if imageio is not None:
+            try:
+                frames_iter = imageio.imiter(video_path)
+                frames = []
+                for idx, frame in enumerate(frames_iter):
+                    frames.append(frame)
+                    if max_frames and max_frames > 0 and idx + 1 >= max_frames:
+                        break
+                if frames:
+                    return np.stack(frames, axis=0)
+            except Exception:
                 return None
 
-            if isinstance(value, (str, bytes, bytearray)):
-                return value
+        return None
 
-            if isinstance(value, Mapping):
-                entry = dict(value)
-                source = entry.get("video")
-                if source is None:
-                    source = entry.get("path")
-                if source is None:
-                    source = entry.get("frames")
-                return _coerce_video_value(source)
+    @staticmethod
+    def _coerce_vllm_video_payload(video_inputs: Any, default_nframes: int = 32) -> List[Dict[str, Any]]:
+        """
+        Normalize arbitrary "video inputs" into a vLLM-friendly payload that only
+        references on-disk videos. Frames, tensors, and arrays are discarded so the
+        downstream parser never receives inline pixel buffers (which vLLM rejects).
+        """
+        import os
 
-            if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)) and not (
-                np is not None and isinstance(value, np.ndarray)  # type: ignore[attr-defined]
-            ):
-                sequence = list(value)
-                if not sequence:
-                    return None
-                if len(sequence) == 2 and isinstance(sequence[0], (str, bytes, bytearray)):
-                    return _coerce_video_value(sequence[0])
-                if np is not None:  # type: ignore[attr-defined]
-                    frames: List[Any] = []
-                    for frame in sequence:
-                        coerced = _coerce_video_value(frame)
-                        if isinstance(coerced, np.ndarray):  # type: ignore[attr-defined]
-                            if coerced.ndim == 4 and coerced.shape[0] == 1:
-                                frames.append(coerced[0])
-                            else:
-                                frames.append(coerced)
-                        else:
-                            frames.append(coerced)
-                    if frames and all(isinstance(frame, np.ndarray) and frame.ndim == 3 for frame in frames):  # type: ignore[attr-defined]
-                        stacked = np.stack(frames, axis=0)  # type: ignore[attr-defined]
-                        if stacked.dtype != np.uint8:  # type: ignore[attr-defined]
-                            stacked = np.clip(stacked, 0, 255).astype(np.uint8)  # type: ignore[attr-defined]
-                        return stacked
-                return _coerce_video_value(sequence[0])
+        def _to_path_entry(value: Any) -> Optional[Dict[str, Any]]:
+            if isinstance(value, dict):
+                candidate = value.get("video") or value.get("video_path") or value.get("path")
+            else:
+                candidate = value
 
-            normalised = _normalise_array(value)
-            if np is not None and isinstance(normalised, np.ndarray):  # type: ignore[attr-defined]
-                array = normalised
-                if array.ndim == 3:
-                    return array[None, ...]
-                if array.ndim == 4:
-                    return array
-                if array.ndim == 2:
-                    return array[None, ..., None]
-            return normalised
+            if isinstance(candidate, (str, os.PathLike)):
+                path_str = os.fspath(candidate)
+                if path_str:
+                    entry: Dict[str, Any] = {"video": path_str}
+                    if isinstance(value, dict) and isinstance(value.get("nframes"), int):
+                        entry["nframes"] = value["nframes"]
+                    elif isinstance(default_nframes, int) and default_nframes > 0:
+                        entry["nframes"] = default_nframes
+                    return entry
+            return None
 
         if video_inputs is None:
             return []
 
-        if isinstance(video_inputs, Sequence) and not isinstance(video_inputs, (str, bytes, bytearray)) and not (
-            np is not None and isinstance(video_inputs, np.ndarray)  # type: ignore[attr-defined]
-        ):
-            result: List[Any] = []
+        if isinstance(video_inputs, list):
+            coerced: List[Dict[str, Any]] = []
             for item in video_inputs:
-                coerced = _coerce_video_value(item)
-                if coerced is None:
-                    continue
-                result.append(coerced)
-            return result
+                entry = _to_path_entry(item)
+                if entry:
+                    coerced.append(entry)
+            return coerced
 
-        coerced = _coerce_video_value(video_inputs)
-        return [] if coerced is None else [coerced]
+        entry = _to_path_entry(video_inputs)
+        return [entry] if entry else []
+
 
     def loglikelihood(self, requests: List[Instance]) -> List[Tuple[float, bool]]:
         raise NotImplementedError("Log-likelihood computation is not implemented for Qwen3VL.")

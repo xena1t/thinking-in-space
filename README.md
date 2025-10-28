@@ -136,20 +136,9 @@ python -m lmms_eval \
   --output_path logs/qwen3vl/vsibench
 ```
 
-On GPUs with less memory, swap in the 8B checkpoint:
-
-```bash
-python -m lmms_eval \
-  --model qwen3vl \
-  --model_args pretrained=Qwen/Qwen3-VL-8B-Instruct,modality=video,max_frames_num=32 \
-  --tasks vsibench \
-  --batch_size 1 \
-  --output_path logs/qwen3vl_8b/vsibench
-```
-
 If you enable vLLM remember it still requires the `spawn` multiprocessing start
 method when CUDA is in use. The helper script
-`evaluate_all_in_one.sh --model qwen3vl_30b_32f` (or `--model qwen3vl_8b_32f`) wraps the same command and logs
+`evaluate_all_in_one.sh --model qwen3vl_30b_32f` wraps the same command and logs
 predictions for inspection.
 
 ## Limitations

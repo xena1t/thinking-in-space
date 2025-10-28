@@ -38,16 +38,6 @@ try:  # pragma: no cover - optional model class
 except ImportError:  # pragma: no cover - fallback if class unavailable
     Qwen2VLForConditionalGeneration = None
 
-try:  # pragma: no cover - optional based on transformers version
-    from transformers import AutoModelForVision2Seq
-except ImportError:  # pragma: no cover - fallback for older releases
-    AutoModelForVision2Seq = None
-
-try:  # pragma: no cover - optional model class
-    from transformers import Qwen2VLForConditionalGeneration
-except ImportError:  # pragma: no cover - fallback if class unavailable
-    Qwen2VLForConditionalGeneration = None
-
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 try:  # pragma: no cover - optional dependency that is validated at runtime

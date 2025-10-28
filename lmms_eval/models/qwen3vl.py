@@ -48,16 +48,6 @@ try:  # pragma: no cover - optional model class
 except ImportError:  # pragma: no cover - fallback if class unavailable
     Qwen2VLForConditionalGeneration = None
 
-try:  # pragma: no cover - optional based on transformers version
-    from transformers import AutoModelForVision2Seq
-except ImportError:  # pragma: no cover - fallback for older releases
-    AutoModelForVision2Seq = None
-
-try:  # pragma: no cover - optional model class
-    from transformers import Qwen2VLForConditionalGeneration
-except ImportError:  # pragma: no cover - fallback if class unavailable
-    Qwen2VLForConditionalGeneration = None
-
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 try:  # pragma: no cover - optional dependency that is validated at runtime
@@ -313,20 +303,17 @@ class Qwen3VL(lmms):
                 )
 
             if hf_device_map is None:
-                if self._device.type == "cuda" and torch.cuda.is_available():
-                    torch.cuda.set_device(self._device)
-                self._model = self._model.to(self._device)
+                self._model.to(self._device)
             self._model.eval()
             self.sampling_params = None
-            inferred_map = getattr(self._model, "hf_device_map", None)
-            self._hf_device_map = inferred_map or hf_device_map
+            self._hf_device_map = hf_device_map
 
             try:
                 first_param = next(self._model.parameters())
                 model_device = first_param.device
             except StopIteration:
                 model_device = self._device
-            print(f"[Qwen3VL] HF backend active | device_map={self._hf_device_map} | model_device={model_device}")
+            print(f"[Qwen3VL] HF backend active | device_map={hf_device_map} | model_device={model_device}")
 
         self.modality = modality
         self.max_frames_num = max_frames_num
@@ -439,7 +426,14 @@ class Qwen3VL(lmms):
                     padding=True,
                 )
                 tensor_inputs: Dict[str, torch.Tensor] = {}
-                target_device = self._resolve_tensor_device()
+                if self._hf_device_map is None:
+                    target_device = self._device
+                else:
+                    try:
+                        first_param = next(self._model.parameters())
+                        target_device = first_param.device
+                    except StopIteration:
+                        target_device = self._device
                 for key, value in inputs.items():
                     if isinstance(value, torch.Tensor):
                         tensor_inputs[key] = value.to(target_device, non_blocking=True)
@@ -462,29 +456,6 @@ class Qwen3VL(lmms):
             pbar.update(1)
         pbar.close()
         return res
-
-    def _resolve_tensor_device(self) -> torch.device:
-        if isinstance(self._hf_device_map, dict) and self._hf_device_map:
-            for device in self._hf_device_map.values():
-                if isinstance(device, str) and device.startswith('cuda'):
-                    return torch.device(device)
-                if isinstance(device, int):
-                    return torch.device(f'cuda:{device}')
-                if isinstance(device, torch.device):
-                    return device
-        elif isinstance(self._hf_device_map, str) and self._hf_device_map:
-            if self._hf_device_map == 'cuda':
-                return torch.device('cuda:0')
-            if self._hf_device_map.startswith('cuda'):
-                return torch.device(self._hf_device_map)
-        model_device = getattr(self._model, 'device', None)
-        if isinstance(model_device, torch.device):
-            return model_device
-        if isinstance(model_device, str) and model_device:
-            return torch.device(model_device)
-        if self._device is not None:
-            return self._device
-        return torch.device('cpu')
 
     def _prepare_hf_video_inputs(
         self, raw_video_inputs: List[Any], video_path: str

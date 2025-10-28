@@ -6,7 +6,47 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from tqdm import tqdm
-from transformers import AutoProcessor, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
+
+try:  # pragma: no cover - optional based on transformers version
+    from transformers import AutoModelForVision2Seq
+except ImportError:  # pragma: no cover - fallback for older releases
+    AutoModelForVision2Seq = None
+
+try:  # pragma: no cover - optional model class
+    from transformers import Qwen2VLForConditionalGeneration
+except ImportError:  # pragma: no cover - fallback if class unavailable
+    Qwen2VLForConditionalGeneration = None
+
+try:  # pragma: no cover - optional based on transformers version
+    from transformers import AutoModelForVision2Seq
+except ImportError:  # pragma: no cover - fallback for older releases
+    AutoModelForVision2Seq = None
+
+try:  # pragma: no cover - optional model class
+    from transformers import Qwen2VLForConditionalGeneration
+except ImportError:  # pragma: no cover - fallback if class unavailable
+    Qwen2VLForConditionalGeneration = None
+
+try:  # pragma: no cover - optional based on transformers version
+    from transformers import AutoModelForVision2Seq
+except ImportError:  # pragma: no cover - fallback for older releases
+    AutoModelForVision2Seq = None
+
+try:  # pragma: no cover - optional model class
+    from transformers import Qwen2VLForConditionalGeneration
+except ImportError:  # pragma: no cover - fallback if class unavailable
+    Qwen2VLForConditionalGeneration = None
+
+try:  # pragma: no cover - optional based on transformers version
+    from transformers import AutoModelForVision2Seq
+except ImportError:  # pragma: no cover - fallback for older releases
+    AutoModelForVision2Seq = None
+
+try:  # pragma: no cover - optional model class
+    from transformers import Qwen2VLForConditionalGeneration
+except ImportError:  # pragma: no cover - fallback if class unavailable
+    Qwen2VLForConditionalGeneration = None
 
 try:  # pragma: no cover - optional based on transformers version
     from transformers import AutoModelForVision2Seq

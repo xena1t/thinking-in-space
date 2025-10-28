@@ -58,6 +58,16 @@ try:  # pragma: no cover - optional model class
 except ImportError:  # pragma: no cover - fallback if class unavailable
     Qwen2VLForConditionalGeneration = None
 
+try:  # pragma: no cover - optional based on transformers version
+    from transformers import AutoModelForVision2Seq
+except ImportError:  # pragma: no cover - fallback for older releases
+    AutoModelForVision2Seq = None
+
+try:  # pragma: no cover - optional model class
+    from transformers import Qwen2VLForConditionalGeneration
+except ImportError:  # pragma: no cover - fallback if class unavailable
+    Qwen2VLForConditionalGeneration = None
+
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 try:  # pragma: no cover - optional dependency that is validated at runtime
@@ -222,6 +232,19 @@ class Qwen3VL(lmms):
             ) from exc
         self._process_vision_info = process_vision_info
 
+        kwargs = dict(kwargs)
+        trust_remote_code = bool(kwargs.pop("trust_remote_code", True))
+        dtype_alias = kwargs.pop("dtype", None)
+        torch_dtype_alias = kwargs.pop("torch_dtype", None)
+
+        if dtype_alias is not None:
+            hf_dtype = dtype_alias
+        elif (
+            torch_dtype_alias is not None
+            and (hf_dtype is None or hf_dtype == "auto")
+        ):
+            hf_dtype = torch_dtype_alias
+
         if kwargs:
             unexpected = ", ".join(kwargs.keys())
             raise ValueError(f"Unexpected kwargs provided: {unexpected}")
@@ -231,8 +254,12 @@ class Qwen3VL(lmms):
         self.temperature = float(sampling_temperature)
         self.max_new_tokens = int(max_new_tokens)
 
-        self._processor = AutoProcessor.from_pretrained(self.path, trust_remote_code=True)
-        self._tokenizer = AutoTokenizer.from_pretrained(self.path, trust_remote_code=True)
+        self._processor = AutoProcessor.from_pretrained(
+            self.path, trust_remote_code=trust_remote_code
+        )
+        self._tokenizer = AutoTokenizer.from_pretrained(
+            self.path, trust_remote_code=trust_remote_code
+        )
 
         batch_size_int = int(batch_size)
         if batch_size_int != 1:
@@ -277,15 +304,32 @@ class Qwen3VL(lmms):
                 device = "cuda:0"
 
             hf_device_map = None
-            if device_map and device_map not in ("", "cuda"):
-                hf_device_map = device_map
+            if device_map:
+                normalized = device_map
+                if isinstance(normalized, str):
+                    lowered = normalized.lower()
+                    if lowered in {"auto", "cuda", "cuda:0"}:
+                        print(
+                            f"[Qwen3VL] device_map={normalized!r} treated as single-GPU load; model weights will be placed on {device}"
+                        )
+                        normalized = None
+                    elif lowered.startswith("cuda:") and lowered.count(":") == 1:
+                        pass  # explicit cuda:N device map respected
+                    else:
+                        print(
+                            f"[Qwen3VL] Unrecognized device_map={device_map!r}; using it as provided"
+                        )
+                        normalized = device_map
+                hf_device_map = normalized
             self._device = torch.device(device)
 
             model_kwargs = {
-                "trust_remote_code": True,
+                "trust_remote_code": trust_remote_code,
                 "torch_dtype": torch_dtype,
                 "device_map": hf_device_map,
             }
+            if hf_device_map is None:
+                model_kwargs.pop("device_map")
 
             model_loaded = False
             model_exceptions: List[Exception] = []

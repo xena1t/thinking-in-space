@@ -119,23 +119,16 @@ question-answer pairs from the
 [nyu-visionx/VSI-Bench](https://huggingface.co/datasets/nyu-visionx/VSI-Bench)
 dataset via 🤗 Datasets, so no extra preprocessing is required.
 
-The Qwen3-VL wrapper relies on [vLLM](https://github.com/vllm-project/vllm) for
-generation. Install it in your evaluation environment first, for example:
+The Qwen3-VL wrapper now defaults to the Hugging Face Transformers backend
+because current vLLM releases still assert when presented with video payloads.
+If you *do* want to experiment with vLLM you can opt in via
+`--model_args ... ,use_vllm=True`, but be aware that video inputs may fail until
+upstream fixes land.
+
+A minimal Transformers-based run looks like:
 
 ```bash
-pip install "vllm>=0.5.4"
-```
-
-vLLM expects the multiprocessing start method to be `spawn` when CUDA is in use.
-The integration configures this automatically, but if you run custom Python
-snippets before launching the benchmark make sure you have not already created
-CUDA tensors under the default `fork` context. Restarting the shell or exporting
-`VLLM_WORKER_MULTIPROC_METHOD=spawn` ahead of time avoids that pitfall.
-
-Once the dependencies are ready you can launch the evaluation with
-
-```bash
-accelerate launch --num_processes 1 -m lmms_eval \
+python -m lmms_eval \
   --model qwen3vl \
   --model_args pretrained=Qwen/Qwen3-VL-30B-A3B-Instruct,modality=video,max_frames_num=32 \
   --tasks vsibench \
@@ -143,8 +136,21 @@ accelerate launch --num_processes 1 -m lmms_eval \
   --output_path logs/qwen3vl/vsibench
 ```
 
-The helper script `evaluate_all_in_one.sh --model qwen3vl_30b_32f` wraps the same
-command and logs predictions for inspection.
+On GPUs with less memory, swap in the 8B checkpoint:
+
+```bash
+python -m lmms_eval \
+  --model qwen3vl \
+  --model_args pretrained=Qwen/Qwen3-VL-8B-Instruct,modality=video,max_frames_num=32 \
+  --tasks vsibench \
+  --batch_size 1 \
+  --output_path logs/qwen3vl_8b/vsibench
+```
+
+If you enable vLLM remember it still requires the `spawn` multiprocessing start
+method when CUDA is in use. The helper script
+`evaluate_all_in_one.sh --model qwen3vl_30b_32f` (or `--model qwen3vl_8b_32f`) wraps the same command and logs
+predictions for inspection.
 
 ## Limitations
 

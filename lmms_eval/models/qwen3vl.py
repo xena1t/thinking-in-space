@@ -2,7 +2,7 @@ import multiprocessing as mp
 import os
 import sys
 from collections.abc import Mapping, Sequence
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from tqdm import tqdm
@@ -192,14 +192,32 @@ class Qwen3VL(lmms):
         use_vllm: bool = False,
         hf_dtype: Optional[str] = "auto",
         vllm_kwargs: Optional[Dict[str, object]] = None,
+        repo_root: Optional[Union[str, os.PathLike]] = None,
+        repo_env_var: str = "QWEN3_VL_REPO",
+        repo_default: str = "Qwen3-VL",
         **kwargs,
     ):
         super().__init__()
 
-        repo_root = os.getenv("QWEN3_VL_REPO", "Qwen3-VL")
-        utils_path = os.path.join(repo_root, "qwen-vl-utils", "src")
-        if os.path.isdir(repo_root) and repo_root not in sys.path:
-            sys.path.append(repo_root)
+        def _normalize_repo_path(
+            value: Optional[Union[str, os.PathLike]]
+        ) -> Optional[str]:
+            if value is None:
+                return None
+            try:
+                path_str = os.fspath(value)
+            except TypeError:
+                return None
+            return path_str or None
+
+        explicit_repo_root = _normalize_repo_path(repo_root)
+        env_repo_root = _normalize_repo_path(os.getenv(repo_env_var))
+        resolved_repo_root = explicit_repo_root or env_repo_root or repo_default
+        repo_root_path = os.fspath(resolved_repo_root)
+
+        utils_path = os.path.join(repo_root_path, "qwen-vl-utils", "src")
+        if os.path.isdir(repo_root_path) and repo_root_path not in sys.path:
+            sys.path.append(repo_root_path)
         if os.path.isdir(utils_path) and utils_path not in sys.path:
             sys.path.append(utils_path)
         try:
@@ -208,9 +226,11 @@ class Qwen3VL(lmms):
             raise ImportError(
                 "qwen_vl_utils was not found. Please clone the official "
                 "Qwen3-VL repository next to this project or set the "
-                "QWEN3_VL_REPO environment variable to its location."
+                f"{repo_env_var} environment variable to its location."
             ) from exc
         self._process_vision_info = process_vision_info
+        self._repo_root = repo_root_path
+        self._repo_env_var = repo_env_var
 
         kwargs = dict(kwargs)
         trust_remote_code = bool(kwargs.pop("trust_remote_code", True))

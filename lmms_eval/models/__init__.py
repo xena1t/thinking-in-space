@@ -17,6 +17,7 @@ AVAILABLE_MODELS = {
     "fuyu": "Fuyu",
     "gemini_api": "GeminiAPI",
     "gpt4v": "GPT4V",
+    "gpt5v": "GPT5V",
     "idefics2": "Idefics2",
     "instructblip": "InstructBLIP",
     "internvl": "InternVLChat",

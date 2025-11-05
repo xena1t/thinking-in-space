@@ -36,5 +36,9 @@ lmms_eval_specific_kwargs:
     pre_prompt: ""
     mca_post_prompt: "Answer with the option's letter from the given choices directly."
     na_post_prompt: "Do not response anything other than a single number!"
+  gpt5v:
+    pre_prompt: ""
+    mca_post_prompt: "Answer with the option's letter from the given choices directly."
+    na_post_prompt: "Do not response anything other than a single number!"
 metadata:
   - version: 0.0
